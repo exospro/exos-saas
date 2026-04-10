@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +20,11 @@ load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_TIMEOUT = int(os.environ.get("ML_REBATE_SNAPSHOT_TIMEOUT_SEC", "60"))
 APP_VERSION = "v2"
-
-
-def should_log_progress(index: int, total: int, step: int = 25) -> bool:
-    return index == 1 or index % step == 0 or index == total
+DEFAULT_RETRY_MAX_ATTEMPTS = int(os.environ.get("ML_REBATE_SNAPSHOT_MAX_ATTEMPTS", "4"))
+DEFAULT_RETRY_BASE_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_BASE_SLEEP_SEC", "1.2"))
+DEFAULT_REQUEST_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_REQUEST_SLEEP_SEC", "0.10"))
+DEFAULT_FINAL_REPROCESS = os.environ.get("ML_REBATE_SNAPSHOT_FINAL_REPROCESS", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def to_decimal(value: Any):
@@ -283,6 +286,94 @@ def item_promotions(session: requests.Session, connected_seller_id: int, item_id
     }
 
 
+def _should_retry_status(status_code: int | None) -> bool:
+    return int(status_code or 0) in RETRYABLE_STATUS_CODES
+
+
+def _calc_backoff(attempt: int, base_sleep_sec: float) -> float:
+    if attempt <= 1:
+        return 0.0
+    jitter = random.uniform(0.0, max(base_sleep_sec * 0.25, 0.05))
+    return (base_sleep_sec * (2 ** (attempt - 2))) + jitter
+
+
+def fetch_item_promotions_with_retry(
+    session: requests.Session,
+    connected_seller_id: int,
+    mlb: str,
+    *,
+    max_attempts: int,
+    base_sleep_sec: float,
+) -> dict[str, Any]:
+    last_result: dict[str, Any] | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            sleep_for = _calc_backoff(attempt, base_sleep_sec)
+            print(f"[REBATE][RETRY] mlb={mlb} | tentativa={attempt}/{max_attempts} | aguardando={sleep_for:.2f}s")
+            time.sleep(sleep_for)
+
+        result = item_promotions(session, connected_seller_id, mlb)
+        last_result = result
+
+        if result["ok"]:
+            if attempt > 1:
+                print(f"[REBATE][RETRY] mlb={mlb} | sucesso_na_tentativa={attempt}")
+            return result
+
+        status_code = ((result.get("error") or {}).get("status_code"))
+        if not _should_retry_status(status_code) or attempt >= max_attempts:
+            return result
+
+    return last_result or {
+        "ok": False,
+        "item_id": mlb,
+        "promotions": [],
+        "error": {"status_code": None, "reason": "unknown", "body": {"message": "unexpected retry flow"}},
+    }
+
+
+def reprocess_failed_items(
+    session: requests.Session,
+    connected_seller_id: int,
+    promotions_by_item: dict[str, list[dict[str, Any]]],
+    failed_items: list[dict[str, Any]],
+    *,
+    max_attempts: int,
+    base_sleep_sec: float,
+    request_sleep_sec: float,
+) -> list[dict[str, Any]]:
+    if not failed_items:
+        return []
+
+    print(f"[REBATE][REPROCESS] Iniciando reprocessamento final | itens={len(failed_items)}")
+    remaining: list[dict[str, Any]] = []
+
+    for idx, failed in enumerate(failed_items, start=1):
+        mlb = failed["mlb"]
+        print(f"[REBATE][REPROCESS] {idx}/{len(failed_items)} | mlb={mlb}")
+        result = fetch_item_promotions_with_retry(
+            session,
+            connected_seller_id,
+            mlb,
+            max_attempts=max_attempts,
+            base_sleep_sec=base_sleep_sec,
+        )
+
+        if result["ok"]:
+            promotions_by_item[mlb] = result["promotions"]
+        else:
+            remaining.append({"mlb": mlb, "error": result["error"]})
+            err = result["error"]
+            print(f"[REBATE][REPROCESS][ERRO] mlb={mlb} | status={err['status_code']} | reason={err['reason']}")
+
+        if request_sleep_sec > 0:
+            time.sleep(request_sleep_sec)
+
+    print(f"[REBATE][REPROCESS] Finalizado | restantes={len(remaining)}")
+    return remaining
+
+
 def parse_promotion(item_ctx: dict[str, Any], promo: dict[str, Any]) -> dict[str, Any] | None:
     promotion_id = str(first_non_empty(promo, ["promotion_id", "id"]) or "") or None
     promotion_type = str(first_non_empty(promo, ["promotion_type", "type", "campaign_type"]) or "") or None
@@ -495,6 +586,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connected-seller-id", type=int, required=True, help="ID do seller conectado em ml.connected_seller")
     parser.add_argument("--source-run-id", type=int, default=None, help="run_id fonte do inventory_snapshot; default = último")
     parser.add_argument("--limit-items", type=int, default=None, help="Limita quantidade de MLBs do snapshot")
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_RETRY_MAX_ATTEMPTS, help="Tentativas máximas para 429/500 transitório")
+    parser.add_argument("--base-sleep-sec", type=float, default=DEFAULT_RETRY_BASE_SLEEP_SEC, help="Sleep base para backoff exponencial")
+    parser.add_argument("--request-sleep-sec", type=float, default=DEFAULT_REQUEST_SLEEP_SEC, help="Sleep fixo entre MLBs")
+    parser.add_argument("--final-reprocess", action=argparse.BooleanOptionalAction, default=DEFAULT_FINAL_REPROCESS, help="Reprocessa no fim apenas MLBs que falharam")
     return parser.parse_args()
 
 
@@ -524,18 +619,32 @@ def main() -> None:
                 "source_run_id": args.source_run_id,
                 "limit_items": args.limit_items,
                 "mlb_count": len(grouped_items),
+                "max_attempts": args.max_attempts,
+                "base_sleep_sec": args.base_sleep_sec,
+                "request_sleep_sec": args.request_sleep_sec,
+                "final_reprocess": bool(args.final_reprocess),
             },
         )
 
         try:
-            print(f"[REBATE] Iniciando snapshot | connected_seller_id={connected_seller_id} | mlb_count={len(grouped_items)} | scope_rows={len(scope_rows)}")
             promotions_by_item: dict[str, list[dict[str, Any]]] = {}
             failed_items: list[dict[str, Any]] = []
             mlbs = list(grouped_items.keys())
-            total_mlbs = len(mlbs)
+
+            print(
+                f"[REBATE] Iniciando snapshot | connected_seller_id={connected_seller_id} | "
+                f"mlb_count={len(grouped_items)} | scope_rows={len(scope_rows)} | max_attempts={args.max_attempts} | "
+                f"request_sleep_sec={args.request_sleep_sec} | final_reprocess={bool(args.final_reprocess)}"
+            )
 
             for idx, mlb in enumerate(mlbs, start=1):
-                result = item_promotions(session, connected_seller_id, mlb)
+                result = fetch_item_promotions_with_retry(
+                    session,
+                    connected_seller_id,
+                    mlb,
+                    max_attempts=args.max_attempts,
+                    base_sleep_sec=args.base_sleep_sec,
+                )
 
                 if result["ok"]:
                     promotions_by_item[mlb] = result["promotions"]
@@ -547,10 +656,25 @@ def main() -> None:
                             "error": result["error"],
                         }
                     )
-                    print(f"[REBATE][ERRO] mlb={mlb} | status={result['error']['status_code']} | reason={result['error']['reason']}")
+                    err = result["error"]
+                    print(f"[REBATE][ERRO] mlb={mlb} | status={err['status_code']} | reason={err['reason']}")
 
-                if should_log_progress(idx, total_mlbs, step=25):
-                    print(f"[REBATE] {idx}/{total_mlbs} | mlb={mlb} | failed_items={len(failed_items)}")
+                if idx == 1 or idx % 25 == 0 or idx == len(mlbs):
+                    print(f"[REBATE] {idx}/{len(mlbs)} | mlb={mlb} | failed_items={len(failed_items)}")
+
+                if args.request_sleep_sec > 0:
+                    time.sleep(args.request_sleep_sec)
+
+            if failed_items and args.final_reprocess:
+                failed_items = reprocess_failed_items(
+                    session,
+                    connected_seller_id,
+                    promotions_by_item,
+                    failed_items,
+                    max_attempts=args.max_attempts,
+                    base_sleep_sec=args.base_sleep_sec,
+                    request_sleep_sec=args.request_sleep_sec,
+                )
 
             print(f"[REBATE] Montando linhas para insert | promotions_by_item={len(promotions_by_item)}")
             rows = build_insert_rows(
@@ -570,6 +694,9 @@ def main() -> None:
                     "scope_rows": len(scope_rows),
                     "rows_inserted": inserted,
                     "failed_items": len(failed_items),
+                    "max_attempts": args.max_attempts,
+                    "request_sleep_sec": args.request_sleep_sec,
+                    "final_reprocess": bool(args.final_reprocess),
                 },
             )
 
