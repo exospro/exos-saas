@@ -1,12 +1,11 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse
 import os
 import requests
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from psycopg2.extras import RealDictCursor
-from fastapi.responses import HTMLResponse
-
 from etl.inventory.repository import db_connect
 import subprocess
 
@@ -157,25 +156,29 @@ async def oauth_callback(request: Request):
 
         conn.commit()
 
-    return {
-        "status": "connected",
-        "connected_seller_id": connected_seller_id,
-        "ml_user_id": ml_user_id,
-        "seller_nickname": seller_nickname,
-        "site_id": site_id,
-    }
+    #return {
+    #    "status": "connected",
+    #    "connected_seller_id": connected_seller_id,
+    #    "ml_user_id": ml_user_id,
+    #    "seller_nickname": seller_nickname,
+    #    "site_id": site_id,
+    #}
+
+    return RedirectResponse(url="/painel?connected=1")
 
 @app.get("/run/optimizer")
-def run_optimizer(connected_seller_id: int):
+def run_optimizer(connected_seller_id: int, limit: int = 50, dry_run: bool = True):
 
     cmd = [
         "python3",
         "-m",
         "etl.ml_campaign_optimizer",
         "--connected-seller-id", str(connected_seller_id),
-        "--limit", "50",
-        "--use-cost", "false"
+        "--limit", str(limit)
     ]
+
+    if dry_run:
+        cmd.append("--dry-run")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -227,29 +230,41 @@ def run_full(connected_seller_id: int):
 
 
 @app.get("/painel", response_class=HTMLResponse)
-def painel():
-    return """
+def painel(connected: int = 0):
+    status_msg = "❌ Não conectado"
+
+    if connected == 1:
+        status_msg = "✅ Conta conectada com sucesso"
+
+    return f"""
     <html>
     <head>
         <title>Exos SaaS</title>
         <style>
-            body {
+            body {{
                 font-family: Arial;
                 background: #0f172a;
                 color: white;
                 text-align: center;
                 padding: 50px;
-            }
-            button {
+            }}
+            button {{
                 padding: 15px 25px;
                 margin: 10px;
                 font-size: 16px;
                 border: none;
                 border-radius: 8px;
                 cursor: pointer;
-            }
-            .btn-connect { background: #22c55e; }
-            .btn-run { background: #3b82f6; }
+            }}
+            .btn-connect {{ background: #22c55e; }}
+            .btn-run {{ background: #3b82f6; }}
+            .box {{
+                margin-top: 30px;
+                padding: 20px;
+                background: #1e293b;
+                border-radius: 10px;
+                display: inline-block;
+            }}
         </style>
     </head>
     <body>
@@ -257,7 +272,11 @@ def painel():
         <h1>🚀 Exos SaaS</h1>
         <p>Otimize suas campanhas automaticamente</p>
 
-        <br>
+        <div class="box">
+            <p>{status_msg}</p>
+        </div>
+
+        <br><br>
 
         <a href="/ml/oauth/start?connected_seller_id=1">
             <button class="btn-connect">Conectar Mercado Livre</button>
@@ -265,24 +284,47 @@ def painel():
 
         <br><br>
 
-        <button class="btn-run" onclick="rodar()">Rodar Otimização</button>
+        <div class="box">
+
+            <h3>Configuração</h3>
+
+            <label>
+                <input type="checkbox" id="dryrun" checked>
+                Simulação (não altera campanhas)
+            </label>
+
+            <br><br>
+
+            <label>Quantidade de anúncios:</label><br>
+            <input type="number" id="limit" value="50" style="padding:10px; width:100px">
+
+            <br><br>
+
+            <button class="btn-run" onclick="rodar()">Rodar Otimização</button>
+
+        </div>
+
+        <br><br>
 
         <pre id="output"></pre>
 
         <script>
-            function rodar() {
+            function rodar() {{
+                const dry = document.getElementById("dryrun").checked;
+                const limit = document.getElementById("limit").value;
+
                 document.getElementById("output").innerText = "Executando...";
 
-                fetch('/run/full?connected_seller_id=1')
+                fetch(`/run/optimizer?connected_seller_id=1&limit=${{limit}}&dry_run=${{dry}}`)
                     .then(res => res.json())
-                    .then(data => {
+                    .then(data => {{
                         document.getElementById("output").innerText =
                             JSON.stringify(data, null, 2);
-                    })
-                    .catch(err => {
+                    }})
+                    .catch(err => {{
                         document.getElementById("output").innerText = err;
-                    });
-            }
+                    }});
+            }}
         </script>
 
     </body>
