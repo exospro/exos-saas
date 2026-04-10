@@ -170,7 +170,7 @@ def run_optimizer(connected_seller_id: int):
     cmd = [
         "python3",
         "-m",
-        "etl/ml_campaign_optimizer.py",
+        "etl/ml_campaign_optimizer",
         "--connected-seller-id", str(connected_seller_id),
         "--limit", "50",
         "--use-cost", "false"
