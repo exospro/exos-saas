@@ -164,7 +164,7 @@ async def oauth_callback(request: Request):
         "site_id": site_id,
     }
 
-@app.post("/run/optimizer")
+@app.get("/run/optimizer")
 def run_optimizer(connected_seller_id: int):
 
     cmd = [
