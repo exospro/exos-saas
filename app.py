@@ -5,6 +5,7 @@ import requests
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from psycopg2.extras import RealDictCursor
+from fastapi.responses import HTMLResponse
 
 from etl.inventory.repository import db_connect
 import subprocess
@@ -223,3 +224,67 @@ def run_full(connected_seller_id: int):
         "status": "full run executado",
         "results": results
     }
+
+
+@app.get("/painel", response_class=HTMLResponse)
+def painel():
+    return """
+    <html>
+    <head>
+        <title>Exos SaaS</title>
+        <style>
+            body {
+                font-family: Arial;
+                background: #0f172a;
+                color: white;
+                text-align: center;
+                padding: 50px;
+            }
+            button {
+                padding: 15px 25px;
+                margin: 10px;
+                font-size: 16px;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+            }
+            .btn-connect { background: #22c55e; }
+            .btn-run { background: #3b82f6; }
+        </style>
+    </head>
+    <body>
+
+        <h1>🚀 Exos SaaS</h1>
+        <p>Otimize suas campanhas automaticamente</p>
+
+        <br>
+
+        <a href="/ml/oauth/start?connected_seller_id=1">
+            <button class="btn-connect">Conectar Mercado Livre</button>
+        </a>
+
+        <br><br>
+
+        <button class="btn-run" onclick="rodar()">Rodar Otimização</button>
+
+        <pre id="output"></pre>
+
+        <script>
+            function rodar() {
+                document.getElementById("output").innerText = "Executando...";
+
+                fetch('/run/full?connected_seller_id=1')
+                    .then(res => res.json())
+                    .then(data => {
+                        document.getElementById("output").innerText =
+                            JSON.stringify(data, null, 2);
+                    })
+                    .catch(err => {
+                        document.getElementById("output").innerText = err;
+                    });
+            }
+        </script>
+
+    </body>
+    </html>
+    """
