@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, FileResponse
 import os
 import re
+import time
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -219,6 +220,7 @@ async def oauth_callback(request: Request):
 
     return RedirectResponse(url=f"/painel?connected_seller_id={connected_seller_id}&connected=1")
 
+import time
 
 @app.get("/run/optimizer")
 def run_optimizer(
@@ -247,7 +249,9 @@ def run_optimizer(
     if dry_run:
         cmd.append("--dry-run")
 
+    started = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = round(time.time() - started, 2)
 
     return JSONResponse(
         {
@@ -256,12 +260,17 @@ def run_optimizer(
             "limit": limit,
             "dry_run": dry_run,
             "use_cost": use_cost,
+            "elapsed_seconds": elapsed,
+            "cmd": cmd,
+            "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "csv_file": csv_path.name if csv_path.exists() else None,
         }
     )
 
+
+import time
 
 @app.get("/run/full")
 def run_full(
@@ -270,6 +279,7 @@ def run_full(
     dry_run: bool = True,
     use_cost: bool = False,
 ):
+    started = time.time()
     results = {}
 
     cmd_inventory = [
@@ -317,6 +327,8 @@ def run_full(
     r3 = subprocess.run(cmd_optimizer, capture_output=True, text=True)
     results["optimizer"] = r3.stdout or r3.stderr
 
+    elapsed = round(time.time() - started, 2)
+
     return JSONResponse(
         {
             "status": "full run executado",
@@ -324,11 +336,11 @@ def run_full(
             "limit": limit,
             "dry_run": dry_run,
             "use_cost": use_cost,
-            "results": results,
+            "elapsed_seconds": elapsed,
             "csv_file": csv_path.name if csv_path.exists() else None,
+            "results": results,
         }
     )
-
 
 @app.get("/download/csv")
 def download_csv(filename: str):
