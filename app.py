@@ -22,6 +22,15 @@ AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 ME_URL = "https://api.mercadolibre.com/users/me"
 
+BASE_DIR = Path("/opt/render/project/src")
+CSV_DIR = BASE_DIR / "runtime_csv"
+CSV_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return CSV_DIR / f"{prefix}_{timestamp}.csv"
+
 
 def get_connected_seller_summary(connected_seller_id: int) -> dict:
     with db_connect() as conn:
@@ -214,27 +223,31 @@ async def oauth_callback(request: Request):
 @app.get("/run/optimizer")
 def run_optimizer(
     connected_seller_id: int = 1,
-    limit: int = 50,
+    limit: int = 0,
     dry_run: bool = True,
     use_cost: bool = False,
 ):
+    csv_path = build_csv_path()
+
     cmd = [
         "python3",
         "-m",
         "etl.ml_campaign_optimizer",
         "--connected-seller-id",
         str(connected_seller_id),
-        "--limit",
-        str(limit),
         "--use-cost",
         "true" if use_cost else "false",
+        "--out",
+        str(csv_path),
     ]
+
+    if limit and limit > 0:
+        cmd.extend(["--limit", str(limit)])
 
     if dry_run:
         cmd.append("--dry-run")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-    csv_name = extract_csv_name(result.stdout)
 
     return JSONResponse(
         {
@@ -245,7 +258,7 @@ def run_optimizer(
             "use_cost": use_cost,
             "stdout": result.stdout,
             "stderr": result.stderr,
-            "csv_file": csv_name,
+            "csv_file": csv_path.name if csv_path.exists() else None,
         }
     )
 
@@ -253,7 +266,7 @@ def run_optimizer(
 @app.get("/run/full")
 def run_full(
     connected_seller_id: int = 1,
-    limit: int = 100,
+    limit: int = 0,
     dry_run: bool = True,
     use_cost: bool = False,
 ):
@@ -265,9 +278,9 @@ def run_full(
         "etl.ml_inventory_snapshot_basic",
         "--connected-seller-id",
         str(connected_seller_id),
-        "--limit-items",
-        str(limit),
     ]
+    if limit and limit > 0:
+        cmd_inventory.extend(["--limit-items", str(limit)])
     r1 = subprocess.run(cmd_inventory, capture_output=True, text=True)
     results["inventory"] = r1.stdout or r1.stderr
 
@@ -277,11 +290,13 @@ def run_full(
         "etl.ml_item_promo_rebate_snapshot",
         "--connected-seller-id",
         str(connected_seller_id),
-        "--limit-items",
-        str(limit),
     ]
+    if limit and limit > 0:
+        cmd_rebate.extend(["--limit-items", str(limit)])
     r2 = subprocess.run(cmd_rebate, capture_output=True, text=True)
     results["rebate"] = r2.stdout or r2.stderr
+
+    csv_path = build_csv_path()
 
     cmd_optimizer = [
         "python3",
@@ -289,18 +304,18 @@ def run_full(
         "etl.ml_campaign_optimizer",
         "--connected-seller-id",
         str(connected_seller_id),
-        "--limit",
-        str(limit),
         "--use-cost",
         "true" if use_cost else "false",
+        "--out",
+        str(csv_path),
     ]
+    if limit and limit > 0:
+        cmd_optimizer.extend(["--limit", str(limit)])
     if dry_run:
         cmd_optimizer.append("--dry-run")
 
     r3 = subprocess.run(cmd_optimizer, capture_output=True, text=True)
     results["optimizer"] = r3.stdout or r3.stderr
-
-    csv_name = extract_csv_name(r3.stdout)
 
     return JSONResponse(
         {
@@ -310,15 +325,14 @@ def run_full(
             "dry_run": dry_run,
             "use_cost": use_cost,
             "results": results,
-            "csv_file": csv_name,
+            "csv_file": csv_path.name if csv_path.exists() else None,
         }
     )
 
 
 @app.get("/download/csv")
 def download_csv(filename: str):
-    base_dir = Path("/opt/render/project/src")
-    file_path = base_dir / filename
+    file_path = CSV_DIR / filename
 
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="CSV não encontrado")
@@ -496,8 +510,8 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                 gap: 10px;
                 flex-wrap: wrap;
             }}
-            input[type="number"] {{
-                width: 140px;
+            input[type="number"], select {{
+                width: 220px;
                 padding: 12px 14px;
                 border-radius: 12px;
                 border: none;
@@ -547,6 +561,9 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                 font-size: 14px;
                 margin-top: 8px;
             }}
+            #customLimitRow {{
+                display: none;
+            }}
             @media (max-width: 820px) {{
                 .grid {{
                     grid-template-columns: 1fr;
@@ -587,7 +604,17 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                     </div>
 
                     <div class="form-row">
-                        <label for="limit">Quantidade de anúncios</label>
+                        <label for="limitMode">Escopo</label>
+                        <select id="limitMode" onchange="toggleLimitInput()">
+                            <option value="50">50 anúncios</option>
+                            <option value="100">100 anúncios</option>
+                            <option value="custom">Quantidade personalizada</option>
+                            <option value="all">Todos os anúncios</option>
+                        </select>
+                    </div>
+
+                    <div class="form-row" id="customLimitRow">
+                        <label for="limit">Quantidade personalizada</label>
                         <input type="number" id="limit" value="50" />
                     </div>
 
@@ -627,9 +654,27 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
         </div>
 
         <script>
+            function toggleLimitInput() {{
+                const mode = document.getElementById("limitMode").value;
+                const row = document.getElementById("customLimitRow");
+                row.style.display = mode === "custom" ? "block" : "none";
+            }}
+
+            function getLimitValue() {{
+                const mode = document.getElementById("limitMode").value;
+
+                if (mode === "all") {{
+                    return 0;
+                }}
+                if (mode === "custom") {{
+                    return document.getElementById("limit").value || 0;
+                }}
+                return mode;
+            }}
+
             function getParams() {{
                 const connectedSellerId = document.getElementById("connectedSellerId").value;
-                const limit = document.getElementById("limit").value;
+                const limit = getLimitValue();
                 const dryRun = document.getElementById("dryrun").checked;
                 const useCost = document.getElementById("usecost").checked;
 
@@ -650,11 +695,6 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                 let csvFile = null;
                 if (data && data.csv_file) {{
                     csvFile = data.csv_file;
-                }} else if (data && data.results && data.results.optimizer) {{
-                    const match = data.results.optimizer.match(/campaign_optimizer_audit_[0-9_]+\\.csv/);
-                    if (match) {{
-                        csvFile = match[0];
-                    }}
                 }}
 
                 if (csvFile) {{
@@ -695,6 +735,8 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                     document.getElementById("output").innerText = String(err);
                 }}
             }}
+
+            toggleLimitInput();
         </script>
     </body>
     </html>
