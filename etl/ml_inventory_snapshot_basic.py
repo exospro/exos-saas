@@ -7,11 +7,10 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from psycopg2.extras import execute_values, Json
+from psycopg2.extras import Json, execute_values
 
-from etl.inventory.repository import db_connect, create_run, finish_run
+from etl.inventory.repository import create_run, db_connect, finish_run
 from etl.ml_auth_db_multi import get_valid_access_token
-
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -19,11 +18,21 @@ load_dotenv(BASE_DIR / ".env")
 DEFAULT_TIMEOUT = 60
 SEARCH_URL = "https://api.mercadolibre.com/users/{user_id}/items/search"
 ITEM_URL = "https://api.mercadolibre.com/items/{item_id}"
+MAX_PAGE_SIZE = 100
 
 
 def get_headers(connected_seller_id: int) -> dict[str, str]:
     token = get_valid_access_token(connected_seller_id)
     return {"Authorization": f"Bearer {token}"}
+
+
+
+def _safe_json(resp: requests.Response) -> Any:
+    try:
+        return resp.json()
+    except Exception:
+        return {"_raw": (resp.text or "").strip()[:4000]}
+
 
 
 def get_user_id_for_connected_seller(conn, connected_seller_id: int) -> int:
@@ -51,7 +60,8 @@ def get_user_id_for_connected_seller(conn, connected_seller_id: int) -> int:
     return int(ml_user_id)
 
 
-def fetch_item_ids(
+
+def fetch_item_ids_offset(
     session: requests.Session,
     *,
     connected_seller_id: int,
@@ -61,19 +71,25 @@ def fetch_item_ids(
 ) -> list[str]:
     results: list[str] = []
     offset = 0
+    page_size = min(max(1, int(limit)), MAX_PAGE_SIZE)
 
     while True:
         url = SEARCH_URL.format(user_id=user_id)
-        params = {"limit": limit, "offset": offset}
+        params = {"limit": page_size, "offset": offset}
         resp = session.get(
             url,
             headers=get_headers(connected_seller_id),
             params=params,
             timeout=DEFAULT_TIMEOUT,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
+        if not resp.ok:
+            raise RuntimeError(
+                f"Erro na paginação por offset do inventory. "
+                f"status={resp.status_code} offset={offset} body={_safe_json(resp)}"
+            )
+
+        data = _safe_json(resp)
         page_results = data.get("results") or []
         if not page_results:
             break
@@ -85,12 +101,99 @@ def fetch_item_ids(
 
         paging = data.get("paging") or {}
         total = int(paging.get("total") or 0)
-        offset += limit
+        offset += page_size
 
         if offset >= total:
             break
 
     return results
+
+
+
+def fetch_item_ids_scan(
+    session: requests.Session,
+    *,
+    connected_seller_id: int,
+    user_id: int,
+    limit: int = 100,
+    max_items: int | None = None,
+) -> list[str]:
+    results: list[str] = []
+    scroll_id: str | None = None
+    page_size = min(max(1, int(limit)), MAX_PAGE_SIZE)
+
+    while True:
+        url = SEARCH_URL.format(user_id=user_id)
+        params = {
+            "search_type": "scan",
+            "limit": page_size,
+        }
+        if scroll_id:
+            params["scroll_id"] = scroll_id
+
+        resp = session.get(
+            url,
+            headers=get_headers(connected_seller_id),
+            params=params,
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+        if not resp.ok:
+            raise RuntimeError(
+                f"Erro na paginação scan do inventory. "
+                f"status={resp.status_code} scroll_id={scroll_id} body={_safe_json(resp)}"
+            )
+
+        data = _safe_json(resp)
+        page_results = data.get("results")
+
+        if not page_results:
+            break
+
+        results.extend([str(x) for x in page_results])
+
+        if max_items is not None and len(results) >= max_items:
+            return results[:max_items]
+
+        scroll_id = data.get("scroll_id")
+        if not scroll_id:
+            break
+
+    return results
+
+
+
+def fetch_item_ids(
+    session: requests.Session,
+    *,
+    connected_seller_id: int,
+    user_id: int,
+    limit: int = 50,
+    max_items: int | None = None,
+) -> list[str]:
+    """
+    Usa search_type=scan para suportar sellers com mais de 1000 anúncios.
+    A própria doc do Mercado Livre indica scan para passar de 1000 registros.
+    Se scan falhar, faz fallback para paginação por offset.
+    """
+    try:
+        return fetch_item_ids_scan(
+            session,
+            connected_seller_id=connected_seller_id,
+            user_id=user_id,
+            limit=limit,
+            max_items=max_items,
+        )
+    except Exception as scan_exc:
+        print(f"SCAN FALHOU, tentando OFFSET. detalhe={scan_exc}")
+        return fetch_item_ids_offset(
+            session,
+            connected_seller_id=connected_seller_id,
+            user_id=user_id,
+            limit=limit,
+            max_items=max_items,
+        )
+
 
 
 def fetch_item_detail(
@@ -107,6 +210,7 @@ def fetch_item_detail(
     )
     resp.raise_for_status()
     return resp.json()
+
 
 
 def build_rows(
@@ -181,6 +285,7 @@ def build_rows(
     return rows
 
 
+
 def insert_rows(conn, rows: list[tuple]) -> int:
     if not rows:
         return 0
@@ -210,6 +315,7 @@ def insert_rows(conn, rows: list[tuple]) -> int:
     return len(rows)
 
 
+
 def ensure_raw_json_column(conn) -> None:
     sql = """
     ALTER TABLE ml.inventory_snapshot_item
@@ -218,6 +324,7 @@ def ensure_raw_json_column(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,10 +346,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--page-size",
         type=int,
-        default=50,
-        help="Quantidade por página na busca de item ids",
+        default=100,
+        help="Quantidade por página na busca de item ids. Máximo efetivo: 100",
     )
     return parser.parse_args()
+
 
 
 def main() -> None:
@@ -264,9 +372,9 @@ def main() -> None:
             params={
                 "connected_seller_id": connected_seller_id,
                 "user_id": user_id,
-                "page_size": args.page_size,
+                "page_size": min(max(1, int(args.page_size)), MAX_PAGE_SIZE),
                 "limit_items": args.limit_items,
-                "mode": "basic",
+                "mode": "basic_scan",
             },
         )
 
@@ -303,7 +411,7 @@ def main() -> None:
                 totals={
                     "item_ids_found": len(item_ids),
                     "rows_inserted": inserted,
-                    "mode": "basic",
+                    "mode": "basic_scan",
                 },
             )
 
@@ -315,6 +423,7 @@ def main() -> None:
                     "run_id": run_id,
                     "item_ids_found": len(item_ids),
                     "rows_inserted": inserted,
+                    "mode": "basic_scan",
                 }
             )
 
