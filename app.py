@@ -80,7 +80,7 @@ def get_connected_seller_summary(connected_seller_id: int) -> dict:
 
 
 def extract_csv_name(text: str) -> str | None:
-    match = re.search(r'campaign_optimizer_audit_[0-9_]+\.csv', text or "")
+    match = re.search(r"campaign_optimizer_audit_[0-9_]+\.csv", text or "")
     return match.group(0) if match else None
 
 
@@ -220,7 +220,6 @@ async def oauth_callback(request: Request):
 
     return RedirectResponse(url=f"/painel?connected_seller_id={connected_seller_id}&connected=1")
 
-import time
 
 @app.get("/run/optimizer")
 def run_optimizer(
@@ -269,8 +268,6 @@ def run_optimizer(
         }
     )
 
-
-import time
 
 @app.get("/run/full")
 def run_full(
@@ -341,6 +338,68 @@ def run_full(
             "results": results,
         }
     )
+
+
+@app.get("/run/full_async")
+def run_full_async(
+    connected_seller_id: int = 1,
+    limit: int = 0,
+    dry_run: bool = True,
+    use_cost: bool = False,
+):
+    csv_path = build_csv_path()
+
+    cmd = [
+        "python3",
+        "-m",
+        "etl.ml_inventory_snapshot_basic",
+        "--connected-seller-id",
+        str(connected_seller_id),
+    ]
+    if limit and limit > 0:
+        cmd.extend(["--limit-items", str(limit)])
+    subprocess.Popen(cmd)
+
+    cmd = [
+        "python3",
+        "-m",
+        "etl.ml_item_promo_rebate_snapshot",
+        "--connected-seller-id",
+        str(connected_seller_id),
+    ]
+    if limit and limit > 0:
+        cmd.extend(["--limit-items", str(limit)])
+    subprocess.Popen(cmd)
+
+    cmd = [
+        "python3",
+        "-m",
+        "etl.ml_campaign_optimizer",
+        "--connected-seller-id",
+        str(connected_seller_id),
+        "--use-cost",
+        "true" if use_cost else "false",
+        "--out",
+        str(csv_path),
+    ]
+    if limit and limit > 0:
+        cmd.extend(["--limit", str(limit)])
+    if dry_run:
+        cmd.append("--dry-run")
+    subprocess.Popen(cmd)
+
+    return JSONResponse(
+        {
+            "status": "execução iniciada em background",
+            "connected_seller_id": connected_seller_id,
+            "limit": limit,
+            "dry_run": dry_run,
+            "use_cost": use_cost,
+            "csv_file": csv_path.name,
+            "message": "Para todos os anúncios, o pipeline foi disparado em background.",
+        }
+    )
+
 
 @app.get("/download/csv")
 def download_csv(filename: str):
@@ -516,12 +575,6 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                 font-weight: 700;
                 color: #dbe6ff;
             }}
-            .form-inline {{
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                flex-wrap: wrap;
-            }}
             input[type="number"], select {{
                 width: 220px;
                 padding: 12px 14px;
@@ -646,7 +699,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                     </div>
 
                     <div class="muted">
-                        Pipeline completo executa: inventory snapshot → rebate snapshot → optimizer
+                        Para “Todos os anúncios”, o pipeline completo será disparado em background.
                     </div>
                 </div>
             </div>
@@ -735,9 +788,13 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
 
             async function rodarFull() {{
                 const p = getParams();
-                document.getElementById("output").innerText = "Executando pipeline completo...";
+                const endpoint = Number(p.limit) === 0 ? "/run/full_async" : "/run/full";
+                document.getElementById("output").innerText =
+                    Number(p.limit) === 0
+                        ? "Disparando pipeline completo em background..."
+                        : "Executando pipeline completo...";
 
-                const url = `/run/full?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
+                const url = `${{endpoint}}?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
 
                 try {{
                     const res = await fetch(url);
