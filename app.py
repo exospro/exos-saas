@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from psycopg2.extras import RealDictCursor
 
 from etl.inventory.repository import db_connect
+import subprocess
 
 app = FastAPI()
 
@@ -161,4 +162,23 @@ async def oauth_callback(request: Request):
         "ml_user_id": ml_user_id,
         "seller_nickname": seller_nickname,
         "site_id": site_id,
+    }
+
+@app.post("/run/optimizer")
+def run_optimizer(connected_seller_id: int):
+
+    cmd = [
+        "python3",
+        "etl/ml_campaign_optimizer.py",
+        "--connected-seller-id", str(connected_seller_id),
+        "--limit", "50",
+        "--use-cost", "false"
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    return {
+        "status": "executado",
+        "stdout": result.stdout,
+        "stderr": result.stderr
     }
