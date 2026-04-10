@@ -26,11 +26,18 @@ ME_URL = "https://api.mercadolibre.com/users/me"
 BASE_DIR = Path("/opt/render/project/src")
 CSV_DIR = BASE_DIR / "runtime_csv"
 CSV_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = BASE_DIR / "runtime_logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return CSV_DIR / f"{prefix}_{timestamp}.csv"
+
+
+def build_log_path(prefix: str = "pipeline_full") -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return LOG_DIR / f"{prefix}_{timestamp}.log"
 
 
 def get_connected_seller_summary(connected_seller_id: int) -> dict:
@@ -193,7 +200,6 @@ async def oauth_callback(request: Request):
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if is_new:
-                # Se esse ml_user_id já existir, reaproveita o registro existente
                 cur.execute(
                     """
                     SELECT id, account_id
@@ -307,6 +313,74 @@ async def oauth_callback(request: Request):
     return RedirectResponse(url=redirect_url)
 
 
+@app.get("/run/inventory")
+def run_inventory(
+    connected_seller_id: int = 1,
+    limit: int = 0,
+):
+    cmd = [
+        "python3",
+        "-m",
+        "etl.ml_inventory_snapshot_basic",
+        "--connected-seller-id",
+        str(connected_seller_id),
+    ]
+
+    if limit and limit > 0:
+        cmd.extend(["--limit-items", str(limit)])
+
+    started = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = round(time.time() - started, 2)
+
+    return JSONResponse(
+        {
+            "status": "inventory executado",
+            "connected_seller_id": connected_seller_id,
+            "limit": limit,
+            "elapsed_seconds": elapsed,
+            "cmd": cmd,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    )
+
+
+@app.get("/run/rebate")
+def run_rebate(
+    connected_seller_id: int = 1,
+    limit: int = 0,
+):
+    cmd = [
+        "python3",
+        "-m",
+        "etl.ml_item_promo_rebate_snapshot",
+        "--connected-seller-id",
+        str(connected_seller_id),
+    ]
+
+    if limit and limit > 0:
+        cmd.extend(["--limit-items", str(limit)])
+
+    started = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = round(time.time() - started, 2)
+
+    return JSONResponse(
+        {
+            "status": "rebate executado",
+            "connected_seller_id": connected_seller_id,
+            "limit": limit,
+            "elapsed_seconds": elapsed,
+            "cmd": cmd,
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    )
+
+
 @app.get("/run/optimizer")
 def run_optimizer(
     connected_seller_id: int = 1,
@@ -375,7 +449,22 @@ def run_full(
     if limit and limit > 0:
         cmd_inventory.extend(["--limit-items", str(limit)])
     r1 = subprocess.run(cmd_inventory, capture_output=True, text=True)
-    results["inventory"] = r1.stdout or r1.stderr
+    results["inventory"] = {
+        "returncode": r1.returncode,
+        "stdout": r1.stdout,
+        "stderr": r1.stderr,
+    }
+    if r1.returncode != 0:
+        return JSONResponse(
+            {
+                "status": "erro no inventory",
+                "connected_seller_id": connected_seller_id,
+                "limit": limit,
+                "elapsed_seconds": round(time.time() - started, 2),
+                "results": results,
+            },
+            status_code=500,
+        )
 
     cmd_rebate = [
         "python3",
@@ -387,7 +476,22 @@ def run_full(
     if limit and limit > 0:
         cmd_rebate.extend(["--limit-items", str(limit)])
     r2 = subprocess.run(cmd_rebate, capture_output=True, text=True)
-    results["rebate"] = r2.stdout or r2.stderr
+    results["rebate"] = {
+        "returncode": r2.returncode,
+        "stdout": r2.stdout,
+        "stderr": r2.stderr,
+    }
+    if r2.returncode != 0:
+        return JSONResponse(
+            {
+                "status": "erro no rebate",
+                "connected_seller_id": connected_seller_id,
+                "limit": limit,
+                "elapsed_seconds": round(time.time() - started, 2),
+                "results": results,
+            },
+            status_code=500,
+        )
 
     csv_path = build_csv_path()
 
@@ -408,13 +512,20 @@ def run_full(
         cmd_optimizer.append("--dry-run")
 
     r3 = subprocess.run(cmd_optimizer, capture_output=True, text=True)
-    results["optimizer"] = r3.stdout or r3.stderr
+    results["optimizer"] = {
+        "returncode": r3.returncode,
+        "stdout": r3.stdout,
+        "stderr": r3.stderr,
+    }
 
     elapsed = round(time.time() - started, 2)
 
+    status_code = 200 if r3.returncode == 0 else 500
+    status_text = "full run executado" if r3.returncode == 0 else "erro no optimizer"
+
     return JSONResponse(
         {
-            "status": "full run executado",
+            "status": status_text,
             "connected_seller_id": connected_seller_id,
             "limit": limit,
             "dry_run": dry_run,
@@ -422,7 +533,8 @@ def run_full(
             "elapsed_seconds": elapsed,
             "csv_file": csv_path.name if csv_path.exists() else None,
             "results": results,
-        }
+        },
+        status_code=status_code,
     )
 
 
@@ -434,55 +546,51 @@ def run_full_async(
     use_cost: bool = False,
 ):
     csv_path = build_csv_path()
+    log_path = build_log_path()
 
-    cmd = [
-        "python3",
-        "-m",
-        "etl.ml_inventory_snapshot_basic",
-        "--connected-seller-id",
-        str(connected_seller_id),
+    shell_cmd_parts = [
+        f"echo '[START] $(date)'",
+        (
+            "python3 -m etl.ml_inventory_snapshot_basic "
+            f"--connected-seller-id {connected_seller_id}"
+            + (f" --limit-items {limit}" if limit and limit > 0 else "")
+        ),
+        (
+            "python3 -m etl.ml_item_promo_rebate_snapshot "
+            f"--connected-seller-id {connected_seller_id}"
+            + (f" --limit-items {limit}" if limit and limit > 0 else "")
+        ),
+        (
+            "python3 -m etl.ml_campaign_optimizer "
+            f"--connected-seller-id {connected_seller_id} "
+            f"--use-cost {'true' if use_cost else 'false'} "
+            f"--out {str(csv_path)}"
+            + (f" --limit {limit}" if limit and limit > 0 else "")
+            + (" --dry-run" if dry_run else "")
+        ),
+        f"echo '[END] $(date)'",
     ]
-    if limit and limit > 0:
-        cmd.extend(["--limit-items", str(limit)])
-    subprocess.Popen(cmd)
 
-    cmd = [
-        "python3",
-        "-m",
-        "etl.ml_item_promo_rebate_snapshot",
-        "--connected-seller-id",
-        str(connected_seller_id),
-    ]
-    if limit and limit > 0:
-        cmd.extend(["--limit-items", str(limit)])
-    subprocess.Popen(cmd)
+    chained_cmd = " && ".join(shell_cmd_parts)
+    final_cmd = f"bash -lc {subprocess.list2cmdline([chained_cmd])} >> {subprocess.list2cmdline([str(log_path)])} 2>&1"
 
-    cmd = [
-        "python3",
-        "-m",
-        "etl.ml_campaign_optimizer",
-        "--connected-seller-id",
-        str(connected_seller_id),
-        "--use-cost",
-        "true" if use_cost else "false",
-        "--out",
-        str(csv_path),
-    ]
-    if limit and limit > 0:
-        cmd.extend(["--limit", str(limit)])
-    if dry_run:
-        cmd.append("--dry-run")
-    subprocess.Popen(cmd)
+    subprocess.Popen(
+        ["bash", "-lc", final_cmd],
+        cwd=str(BASE_DIR),
+        start_new_session=True,
+    )
 
     return JSONResponse(
         {
             "status": "execução iniciada em background",
+            "mode": "sequencial",
             "connected_seller_id": connected_seller_id,
             "limit": limit,
             "dry_run": dry_run,
             "use_cost": use_cost,
             "csv_file": csv_path.name,
-            "message": "Para todos os anúncios, o pipeline foi disparado em background.",
+            "log_file": log_path.name,
+            "message": "O pipeline completo foi disparado em background de forma sequencial: inventory -> rebate -> optimizer.",
         }
     )
 
@@ -498,6 +606,20 @@ def download_csv(filename: str):
         path=str(file_path),
         filename=filename,
         media_type="text/csv",
+    )
+
+
+@app.get("/download/log")
+def download_log(filename: str):
+    file_path = LOG_DIR / filename
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Log não encontrado")
+
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="text/plain",
     )
 
 
@@ -549,10 +671,7 @@ def painel(
         </div>
         """
 
-    new_connect_href = (
-        f"/ml/oauth/start?account_id={account_id}" if account_id else "#"
-    )
-
+    new_connect_href = f"/ml/oauth/start?account_id={account_id}" if account_id else "#"
     reconnect_href = f"/ml/oauth/start?connected_seller_id={connected_seller_id}"
 
     return f"""
@@ -561,197 +680,50 @@ def painel(
         <title>Exos SaaS</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
-            * {{
-                box-sizing: border-box;
-            }}
+            * {{ box-sizing: border-box; }}
             body {{
                 margin: 0;
                 font-family: Arial, sans-serif;
                 background: linear-gradient(180deg, #06122b 0%, #091a3f 100%);
                 color: #ffffff;
             }}
-            .container {{
-                max-width: 980px;
-                margin: 0 auto;
-                padding: 40px 20px 60px;
-            }}
-            .hero {{
-                text-align: center;
-                margin-bottom: 28px;
-            }}
-            .hero h1 {{
-                font-size: 56px;
-                margin: 0 0 10px;
-                font-weight: 800;
-            }}
-            .hero p {{
-                font-size: 20px;
-                color: #d8e3ff;
-                margin: 0;
-            }}
-            .flash {{
-                max-width: 760px;
-                margin: 0 auto 20px;
-                padding: 14px 18px;
-                border-radius: 14px;
-                text-align: center;
-                font-weight: 700;
-            }}
-            .flash.success {{
-                background: rgba(34, 197, 94, 0.18);
-                border: 1px solid rgba(34, 197, 94, 0.35);
-                color: #d8ffe5;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 20px;
-                align-items: start;
-            }}
-            .card {{
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 20px;
-                padding: 24px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.22);
-            }}
-            .card h2 {{
-                margin: 0 0 18px;
-                font-size: 28px;
-            }}
-            .status-card {{
-                border-radius: 16px;
-                padding: 18px;
-            }}
-            .status-card.connected {{
-                background: rgba(34, 197, 94, 0.14);
-                border: 1px solid rgba(34, 197, 94, 0.28);
-            }}
-            .status-card.disconnected {{
-                background: rgba(239, 68, 68, 0.12);
-                border: 1px solid rgba(239, 68, 68, 0.25);
-            }}
-            .status-title {{
-                font-size: 24px;
-                font-weight: 800;
-                margin-bottom: 10px;
-            }}
-            .status-line {{
-                font-size: 16px;
-                color: #e8eeff;
-                margin-top: 6px;
-            }}
-            .actions {{
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-                margin-top: 16px;
-            }}
-            .btn {{
-                width: 100%;
-                border: none;
-                border-radius: 14px;
-                padding: 16px 18px;
-                font-size: 18px;
-                font-weight: 700;
-                cursor: pointer;
-                transition: transform .05s ease, opacity .2s ease;
-                text-decoration: none;
-            }}
-            .btn:hover {{
-                opacity: .94;
-            }}
-            .btn:active {{
-                transform: scale(0.99);
-            }}
-            .btn-connect {{
-                background: #22c55e;
-                color: #051b0d;
-            }}
-            .btn-primary {{
-                background: #3b82f6;
-                color: #ffffff;
-            }}
-            .btn-secondary {{
-                background: #0f172a;
-                color: #ffffff;
-                border: 1px solid rgba(255,255,255,0.15);
-            }}
-            .form-row {{
-                margin-bottom: 14px;
-                text-align: left;
-            }}
-            .form-row label {{
-                display: block;
-                margin-bottom: 8px;
-                font-weight: 700;
-                color: #dbe6ff;
-            }}
-            input[type="number"], select {{
-                width: 220px;
-                padding: 12px 14px;
-                border-radius: 12px;
-                border: none;
-                font-size: 18px;
-            }}
-            .check {{
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                font-size: 18px;
-                margin: 10px 0;
-            }}
-            .output-wrap {{
-                margin-top: 24px;
-            }}
-            .output-head {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                gap: 12px;
-                flex-wrap: wrap;
-                margin-bottom: 10px;
-            }}
-            .download-area {{
-                display: none;
-            }}
-            .download-area.show {{
-                display: inline-block;
-            }}
-            pre {{
-                white-space: pre-wrap;
-                word-break: break-word;
-                text-align: left;
-                background: #020817;
-                color: #dbeafe;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 18px;
-                border-radius: 16px;
-                min-height: 180px;
-                max-height: 520px;
-                overflow: auto;
-                font-size: 13px;
-                line-height: 1.45;
-            }}
-            .muted {{
-                color: #9fb0d9;
-                font-size: 14px;
-                margin-top: 8px;
-            }}
-            #customLimitRow {{
-                display: none;
-            }}
-            a.button-link {{
-                text-decoration: none;
-                display: block;
-            }}
+            .container {{ max-width: 1100px; margin: 0 auto; padding: 40px 20px 60px; }}
+            .hero {{ text-align: center; margin-bottom: 28px; }}
+            .hero h1 {{ font-size: 56px; margin: 0 0 10px; font-weight: 800; }}
+            .hero p {{ font-size: 20px; color: #d8e3ff; margin: 0; }}
+            .flash {{ max-width: 760px; margin: 0 auto 20px; padding: 14px 18px; border-radius: 14px; text-align: center; font-weight: 700; }}
+            .flash.success {{ background: rgba(34, 197, 94, 0.18); border: 1px solid rgba(34, 197, 94, 0.35); color: #d8ffe5; }}
+            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }}
+            .card {{ background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.08); border-radius: 20px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.22); }}
+            .card h2 {{ margin: 0 0 18px; font-size: 28px; }}
+            .status-card {{ border-radius: 16px; padding: 18px; }}
+            .status-card.connected {{ background: rgba(34, 197, 94, 0.14); border: 1px solid rgba(34, 197, 94, 0.28); }}
+            .status-card.disconnected {{ background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.25); }}
+            .status-title {{ font-size: 24px; font-weight: 800; margin-bottom: 10px; }}
+            .status-line {{ font-size: 16px; color: #e8eeff; margin-top: 6px; }}
+            .actions {{ display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }}
+            .btn {{ width: 100%; border: none; border-radius: 14px; padding: 16px 18px; font-size: 18px; font-weight: 700; cursor: pointer; transition: transform .05s ease, opacity .2s ease; text-decoration: none; }}
+            .btn:hover {{ opacity: .94; }}
+            .btn:active {{ transform: scale(0.99); }}
+            .btn-connect {{ background: #22c55e; color: #051b0d; }}
+            .btn-primary {{ background: #3b82f6; color: #ffffff; }}
+            .btn-secondary {{ background: #0f172a; color: #ffffff; border: 1px solid rgba(255,255,255,0.15); }}
+            .btn-warning {{ background: #92400e; color: #fff7ed; border: 1px solid rgba(255,255,255,0.15); }}
+            .form-row {{ margin-bottom: 14px; text-align: left; }}
+            .form-row label {{ display: block; margin-bottom: 8px; font-weight: 700; color: #dbe6ff; }}
+            input[type="number"], select {{ width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
+            .check {{ display: flex; align-items: center; gap: 10px; font-size: 18px; margin: 10px 0; }}
+            .output-wrap {{ margin-top: 24px; }}
+            .output-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }}
+            .download-area {{ display: none; }}
+            .download-area.show {{ display: inline-block; }}
+            pre {{ white-space: pre-wrap; word-break: break-word; text-align: left; background: #020817; color: #dbeafe; border: 1px solid rgba(255,255,255,0.08); padding: 18px; border-radius: 16px; min-height: 180px; max-height: 520px; overflow: auto; font-size: 13px; line-height: 1.45; }}
+            .muted {{ color: #9fb0d9; font-size: 14px; margin-top: 8px; }}
+            #customLimitRow {{ display: none; }}
+            a.button-link {{ text-decoration: none; display: block; }}
             @media (max-width: 820px) {{
-                .grid {{
-                    grid-template-columns: 1fr;
-                }}
-                .hero h1 {{
-                    font-size: 42px;
-                }}
+                .grid {{ grid-template-columns: 1fr; }}
+                .hero h1 {{ font-size: 42px; }}
             }}
         </style>
     </head>
@@ -815,12 +787,14 @@ def painel(
                     </div>
 
                     <div class="actions">
+                        <button class="btn btn-warning" onclick="rodarInventory()">Rodar apenas inventory</button>
+                        <button class="btn btn-warning" onclick="rodarRebate()">Rodar apenas rebate</button>
                         <button class="btn btn-primary" onclick="rodarOptimizer()">Rodar apenas optimizer</button>
                         <button class="btn btn-secondary" onclick="rodarFull()">Rodar pipeline completo</button>
                     </div>
 
                     <div class="muted">
-                        Para “Todos os anúncios”, o pipeline completo será disparado em background.
+                        Para “Todos os anúncios”, o pipeline completo agora é disparado em background de forma sequencial, e não mais em paralelo.
                     </div>
                 </div>
             </div>
@@ -828,10 +802,17 @@ def painel(
             <div class="output-wrap">
                 <div class="output-head">
                     <h2>Resultado</h2>
-                    <div id="downloadArea" class="download-area">
-                        <a id="downloadLink" href="#" target="_blank">
-                            <button class="btn btn-secondary">Baixar CSV de auditoria</button>
-                        </a>
+                    <div>
+                        <span id="downloadArea" class="download-area">
+                            <a id="downloadLink" href="#" target="_blank">
+                                <button class="btn btn-secondary">Baixar CSV de auditoria</button>
+                            </a>
+                        </span>
+                        <span id="downloadLogArea" class="download-area">
+                            <a id="downloadLogLink" href="#" target="_blank">
+                                <button class="btn btn-secondary">Baixar log do pipeline</button>
+                            </a>
+                        </span>
                     </div>
                 </div>
 
@@ -857,13 +838,8 @@ def painel(
 
             function getLimitValue() {{
                 const mode = document.getElementById("limitMode").value;
-
-                if (mode === "all") {{
-                    return 0;
-                }}
-                if (mode === "custom") {{
-                    return document.getElementById("limit").value || 0;
-                }}
+                if (mode === "all") return 0;
+                if (mode === "custom") return document.getElementById("limit").value || 0;
                 return mode;
             }}
 
@@ -872,13 +848,7 @@ def painel(
                 const limit = getLimitValue();
                 const dryRun = document.getElementById("dryrun").checked;
                 const useCost = document.getElementById("usecost").checked;
-
-                return {{
-                    connectedSellerId,
-                    limit,
-                    dryRun,
-                    useCost
-                }};
+                return {{ connectedSellerId, limit, dryRun, useCost }};
             }}
 
             function updateOutput(data) {{
@@ -886,11 +856,11 @@ def painel(
 
                 const downloadArea = document.getElementById("downloadArea");
                 const downloadLink = document.getElementById("downloadLink");
+                const downloadLogArea = document.getElementById("downloadLogArea");
+                const downloadLogLink = document.getElementById("downloadLogLink");
 
-                let csvFile = null;
-                if (data && data.csv_file) {{
-                    csvFile = data.csv_file;
-                }}
+                let csvFile = data && data.csv_file ? data.csv_file : null;
+                let logFile = data && data.log_file ? data.log_file : null;
 
                 if (csvFile) {{
                     downloadLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`;
@@ -899,14 +869,18 @@ def painel(
                     downloadArea.classList.remove("show");
                     downloadLink.href = "#";
                 }}
+
+                if (logFile) {{
+                    downloadLogLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`;
+                    downloadLogArea.classList.add("show");
+                }} else {{
+                    downloadLogArea.classList.remove("show");
+                    downloadLogLink.href = "#";
+                }}
             }}
 
-            async function rodarOptimizer() {{
-                const p = getParams();
-                document.getElementById("output").innerText = "Executando optimizer...";
-
-                const url = `/run/optimizer?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
-
+            async function runAndShow(url, runningText) {{
+                document.getElementById("output").innerText = runningText;
                 try {{
                     const res = await fetch(url);
                     const data = await res.json();
@@ -914,25 +888,34 @@ def painel(
                 }} catch (err) {{
                     document.getElementById("output").innerText = String(err);
                 }}
+            }}
+
+            async function rodarInventory() {{
+                const p = getParams();
+                const url = `/run/inventory?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`;
+                await runAndShow(url, "Executando inventory...");
+            }}
+
+            async function rodarRebate() {{
+                const p = getParams();
+                const url = `/run/rebate?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`;
+                await runAndShow(url, "Executando rebate...");
+            }}
+
+            async function rodarOptimizer() {{
+                const p = getParams();
+                const url = `/run/optimizer?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
+                await runAndShow(url, "Executando optimizer...");
             }}
 
             async function rodarFull() {{
                 const p = getParams();
                 const endpoint = Number(p.limit) === 0 ? "/run/full_async" : "/run/full";
-                document.getElementById("output").innerText =
-                    Number(p.limit) === 0
-                        ? "Disparando pipeline completo em background..."
-                        : "Executando pipeline completo...";
-
                 const url = `${{endpoint}}?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
-
-                try {{
-                    const res = await fetch(url);
-                    const data = await res.json();
-                    updateOutput(data);
-                }} catch (err) {{
-                    document.getElementById("output").innerText = String(err);
-                }}
+                const msg = Number(p.limit) === 0
+                    ? "Disparando pipeline completo em background de forma sequencial..."
+                    : "Executando pipeline completo...";
+                await runAndShow(url, msg);
             }}
 
             toggleLimitInput();
