@@ -1,16 +1,18 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse
 import os
 import requests
 from urllib.parse import urlencode
-import psycopg2
+from datetime import datetime, timedelta, timezone
+from psycopg2.extras import RealDictCursor
+
+from etl.inventory.repository import db_connect
 
 app = FastAPI()
 
 ML_CLIENT_ID = os.environ["ML_CLIENT_ID"]
 ML_CLIENT_SECRET = os.environ["ML_CLIENT_SECRET"]
 ML_REDIRECT_URI = os.environ["ML_REDIRECT_URI"]
-DATABASE_URL = os.environ["DATABASE_URL"]
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -27,73 +29,136 @@ def health():
     return {"status": "ok"}
 
 
-# 🔹 STEP 1 - REDIRECT PARA AUTORIZAÇÃO
 @app.get("/ml/oauth/start")
-def oauth_start():
+def start_oauth(connected_seller_id: int):
+    state = f"seller:{connected_seller_id}"
+
     params = {
         "response_type": "code",
         "client_id": ML_CLIENT_ID,
         "redirect_uri": ML_REDIRECT_URI,
+        "state": state,
     }
+
     url = f"{AUTH_URL}?{urlencode(params)}"
     return RedirectResponse(url)
 
 
-# 🔹 STEP 2 - CALLBACK
 @app.get("/ml/oauth/callback")
-def oauth_callback(request: Request):
+async def oauth_callback(request: Request):
     code = request.query_params.get("code")
+    state = request.query_params.get("state")
 
     if not code:
-        return {"error": "code não encontrado"}
+        raise HTTPException(status_code=400, detail="Missing code")
 
-    # troca por token
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": ML_CLIENT_ID,
-        "client_secret": ML_CLIENT_SECRET,
-        "code": code,
-        "redirect_uri": ML_REDIRECT_URI,
-    }
+    if not state or not state.startswith("seller:"):
+        raise HTTPException(status_code=400, detail="Invalid state")
 
-    resp = requests.post(TOKEN_URL, data=payload)
-    tokens = resp.json()
+    connected_seller_id = int(state.split(":")[1])
+
+    token_resp = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": ML_CLIENT_ID,
+            "client_secret": ML_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": ML_REDIRECT_URI,
+        },
+        timeout=30,
+    )
+
+    if token_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Token error: {token_resp.text}")
+
+    tokens = token_resp.json()
 
     access_token = tokens["access_token"]
     refresh_token = tokens["refresh_token"]
-    expires_in = tokens["expires_in"]
+    token_type = tokens.get("token_type", "Bearer")
+    scope = tokens.get("scope")
+    expires_in = int(tokens["expires_in"])
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-    # pega dados do seller
-    headers = {"Authorization": f"Bearer {access_token}"}
-    me = requests.get(ME_URL, headers=headers).json()
+    me_resp = requests.get(
+        ME_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
 
-    # salva no banco
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
+    if me_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch user: {me_resp.text}")
 
-    cur.execute("""
-        INSERT INTO ml.connected_seller (
-            ml_user_id, seller_ickname, site_id, email,
-            access_token, refresh_token, token_expires_at
-        )
-        VALUES (%s,%s,%s,%s,%s,%s, NOW() + (%s || ' seconds')::interval)
-        ON CONFLICT (ml_user_id)
-        DO UPDATE SET
-            access_token = EXCLUDED.access_token,
-            refresh_token = EXCLUDED.refresh_token,
-            token_expires_at = EXCLUDED.token_expires_at
-    """, (
-        me["id"],
-        me["nickname"],
-        me["site_id"],
-        me["email"],
-        access_token,
-        refresh_token,
-        expires_in
-    ))
+    me = me_resp.json()
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    ml_user_id = me["id"]
+    seller_nickname = me["nickname"]
+    site_id = me["site_id"]
 
-    return {"status": "seller conectado com sucesso 🚀"}
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE ml.connected_seller
+                   SET ml_user_id = %s,
+                       seller_nickname = %s,
+                       site_id = %s,
+                       status = 'active',
+                       authorized_at = now(),
+                       updated_at = now()
+                 WHERE id = %s
+                RETURNING id
+                """,
+                (ml_user_id, seller_nickname, site_id, connected_seller_id),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"connected_seller_id {connected_seller_id} não encontrado",
+                )
+
+            cur.execute(
+                """
+                INSERT INTO ml.oauth_token (
+                    connected_seller_id,
+                    access_token,
+                    refresh_token,
+                    token_type,
+                    scope,
+                    expires_at,
+                    last_refresh_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (connected_seller_id)
+                DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    token_type = EXCLUDED.token_type,
+                    scope = EXCLUDED.scope,
+                    expires_at = EXCLUDED.expires_at,
+                    last_refresh_at = now(),
+                    updated_at = now()
+                """,
+                (
+                    connected_seller_id,
+                    access_token,
+                    refresh_token,
+                    token_type,
+                    scope,
+                    expires_at,
+                ),
+            )
+
+        conn.commit()
+
+    return {
+        "status": "connected",
+        "connected_seller_id": connected_seller_id,
+        "ml_user_id": ml_user_id,
+        "seller_nickname": seller_nickname,
+        "site_id": site_id,
+    }
