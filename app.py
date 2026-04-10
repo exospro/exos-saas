@@ -73,7 +73,7 @@ def oauth_callback(request: Request):
 
     cur.execute("""
         INSERT INTO ml.connected_seller (
-            ml_user_id, nickname, site_id, email,
+            ml_user_id, seller_ickname, site_id, email,
             access_token, refresh_token, token_expires_at
         )
         VALUES (%s,%s,%s,%s,%s,%s, NOW() + (%s || ' seconds')::interval)
