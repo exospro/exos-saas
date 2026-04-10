@@ -7,6 +7,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
+from psycopg2.extras import RealDictCursor
 
 import requests
 from psycopg2.extras import Json, RealDictCursor
@@ -28,6 +29,7 @@ CSV_DIR = BASE_DIR / "runtime_csv"
 LOG_DIR = BASE_DIR / "runtime_logs"
 CSV_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 
 
 def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
@@ -572,9 +574,28 @@ def run_status(run_id: str):
 
 @app.get("/run/log")
 def run_log(run_id: str):
-    job = get_job_db(run_id)
+    # 1) Busca o job no banco
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    run_id,
+                    status,
+                    step,
+                    log_file,
+                    result_json
+                FROM app.async_job
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+            job = cur.fetchone()
 
-    # 1) tenta arquivo local primeiro
+    if not job:
+        raise HTTPException(status_code=404, detail=f"run_id {run_id} não encontrado")
+
+    # 2) Tenta ler arquivo local primeiro
     log_file = job.get("log_file")
     if log_file:
         path = LOG_DIR / log_file
@@ -582,9 +603,8 @@ def run_log(run_id: str):
             text = path.read_text(encoding="utf-8")
             return PlainTextResponse(text)
 
-    # 2) fallback: usa logs persistidos no banco
+    # 3) Fallback: monta log a partir do result_json salvo no banco
     result_json = job.get("result_json") or {}
-
     parts = []
 
     if isinstance(result_json, dict):
@@ -598,8 +618,9 @@ def run_log(run_id: str):
             returncode = step_data.get("returncode")
             elapsed = step_data.get("elapsed_seconds")
 
-            header = f"===== {step_name.upper()} | returncode={returncode} | elapsed_seconds={elapsed} ====="
-            parts.append(header)
+            parts.append(
+                f"===== {step_name.upper()} | returncode={returncode} | elapsed_seconds={elapsed} ====="
+            )
 
             if stdout:
                 parts.append("[STDOUT]")
@@ -612,11 +633,10 @@ def run_log(run_id: str):
     if parts:
         return PlainTextResponse("\n\n".join(parts))
 
-    # 3) se ainda não houver resultado, devolve algo útil
+    # 4) Se o job ainda estiver rodando e não houver result_json preenchido
     status = job.get("status")
     step = job.get("step")
-    msg = f"Sem log disponível ainda. status={status} step={step}"
-    return PlainTextResponse(msg)
+    return PlainTextResponse(f"Sem log disponível ainda. status={status} step={step}")
 
 
 @app.get("/download/csv")
