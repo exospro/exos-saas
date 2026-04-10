@@ -574,7 +574,7 @@ def run_status(run_id: str):
 
 @app.get("/run/log")
 def run_log(run_id: str):
-    # 1) Busca o job no banco
+    # 1) Busca o job no banco .
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
