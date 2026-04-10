@@ -572,14 +572,51 @@ def run_status(run_id: str):
 
 @app.get("/run/log")
 def run_log(run_id: str):
-    job = get_job(run_id)
+    job = get_job_db(run_id)
+
+    # 1) tenta arquivo local primeiro
     log_file = job.get("log_file")
-    if not log_file:
-        raise HTTPException(status_code=404, detail="Log não encontrado para este run_id")
-    path = LOG_DIR / log_file
-    if not path.exists():
-        return PlainTextResponse("", status_code=200)
-    return PlainTextResponse(path.read_text(encoding="utf-8"))
+    if log_file:
+        path = LOG_DIR / log_file
+        if path.exists() and path.is_file():
+            text = path.read_text(encoding="utf-8")
+            return PlainTextResponse(text)
+
+    # 2) fallback: usa logs persistidos no banco
+    result_json = job.get("result_json") or {}
+
+    parts = []
+
+    if isinstance(result_json, dict):
+        for step_name in ("inventory", "rebate", "optimizer"):
+            step_data = result_json.get(step_name)
+            if not isinstance(step_data, dict):
+                continue
+
+            stdout = (step_data.get("stdout") or "").strip()
+            stderr = (step_data.get("stderr") or "").strip()
+            returncode = step_data.get("returncode")
+            elapsed = step_data.get("elapsed_seconds")
+
+            header = f"===== {step_name.upper()} | returncode={returncode} | elapsed_seconds={elapsed} ====="
+            parts.append(header)
+
+            if stdout:
+                parts.append("[STDOUT]")
+                parts.append(stdout)
+
+            if stderr:
+                parts.append("[STDERR]")
+                parts.append(stderr)
+
+    if parts:
+        return PlainTextResponse("\n\n".join(parts))
+
+    # 3) se ainda não houver resultado, devolve algo útil
+    status = job.get("status")
+    step = job.get("step")
+    msg = f"Sem log disponível ainda. status={status} step={step}"
+    return PlainTextResponse(msg)
 
 
 @app.get("/download/csv")
