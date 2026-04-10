@@ -183,3 +183,43 @@ def run_optimizer(connected_seller_id: int):
         "stdout": result.stdout,
         "stderr": result.stderr
     }
+
+@app.get("/run/full")
+def run_full(connected_seller_id: int):
+
+    import subprocess
+
+    results = {}
+
+    # 1. INVENTORY
+    cmd_inventory = [
+        "python3", "-m", "etl.ml_inventory_snapshot_basic",
+        "--connected-seller-id", str(connected_seller_id),
+        "--limit-items", "100"
+    ]
+    r1 = subprocess.run(cmd_inventory, capture_output=True, text=True)
+    results["inventory"] = r1.stdout or r1.stderr
+
+    # 2. REBATE
+    cmd_rebate = [
+        "python3", "-m", "etl.ml_item_promo_rebate_snapshot",
+        "--connected-seller-id", str(connected_seller_id),
+        "--limit-items", "100"
+    ]
+    r2 = subprocess.run(cmd_rebate, capture_output=True, text=True)
+    results["rebate"] = r2.stdout or r2.stderr
+
+    # 3. OPTIMIZER
+    cmd_optimizer = [
+        "python3", "-m", "etl.ml_campaign_optimizer",
+        "--connected-seller-id", str(connected_seller_id),
+        "--limit", "100",
+        "--use-cost", "false"
+    ]
+    r3 = subprocess.run(cmd_optimizer, capture_output=True, text=True)
+    results["optimizer"] = r3.stdout or r3.stderr
+
+    return {
+        "status": "full run executado",
+        "results": results
+    }
