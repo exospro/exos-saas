@@ -1,13 +1,16 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, FileResponse
 import os
-import requests
-from urllib.parse import urlencode
-from datetime import datetime, timedelta, timezone
-from psycopg2.extras import RealDictCursor
-from etl.inventory.repository import db_connect
+import re
 import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlencode
+
+import requests
+from psycopg2.extras import RealDictCursor
+
+from etl.inventory.repository import db_connect
 
 app = FastAPI()
 
@@ -20,9 +23,60 @@ TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 ME_URL = "https://api.mercadolibre.com/users/me"
 
 
+def get_connected_seller_summary(connected_seller_id: int) -> dict:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id,
+                    cs.ml_user_id,
+                    cs.seller_nickname,
+                    cs.site_id,
+                    cs.status,
+                    cs.authorized_at,
+                    ot.expires_at,
+                    ot.updated_at AS token_updated_at
+                FROM ml.connected_seller cs
+                LEFT JOIN ml.oauth_token ot
+                  ON ot.connected_seller_id = cs.id
+                WHERE cs.id = %s
+                """,
+                (connected_seller_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return {
+            "exists": False,
+            "connected": False,
+            "connected_seller_id": connected_seller_id,
+        }
+
+    connected = bool(row["ml_user_id"]) and row["status"] == "active"
+
+    return {
+        "exists": True,
+        "connected": connected,
+        "connected_seller_id": row["id"],
+        "ml_user_id": row["ml_user_id"],
+        "seller_nickname": row["seller_nickname"],
+        "site_id": row["site_id"],
+        "status": row["status"],
+        "authorized_at": row["authorized_at"],
+        "expires_at": row["expires_at"],
+        "token_updated_at": row["token_updated_at"],
+    }
+
+
+def extract_csv_name(text: str) -> str | None:
+    match = re.search(r'campaign_optimizer_audit_[0-9_]+\.csv', text or "")
+    return match.group(0) if match else None
+
+
 @app.get("/")
 def root():
-    return {"message": "Exos SaaS rodando 🚀"}
+    return RedirectResponse(url="/painel")
 
 
 @app.get("/health")
@@ -31,16 +85,14 @@ def health():
 
 
 @app.get("/ml/oauth/start")
-def start_oauth(connected_seller_id: int):
+def start_oauth(connected_seller_id: int = 1):
     state = f"seller:{connected_seller_id}"
-
     params = {
         "response_type": "code",
         "client_id": ML_CLIENT_ID,
         "redirect_uri": ML_REDIRECT_URI,
         "state": state,
     }
-
     url = f"{AUTH_URL}?{urlencode(params)}"
     return RedirectResponse(url)
 
@@ -156,177 +208,494 @@ async def oauth_callback(request: Request):
 
         conn.commit()
 
-    #return {
-    #    "status": "connected",
-    #    "connected_seller_id": connected_seller_id,
-    #    "ml_user_id": ml_user_id,
-    #    "seller_nickname": seller_nickname,
-    #    "site_id": site_id,
-    #}
+    return RedirectResponse(url=f"/painel?connected_seller_id={connected_seller_id}&connected=1")
 
-    return RedirectResponse(url="/painel?connected=1")
 
 @app.get("/run/optimizer")
-def run_optimizer(connected_seller_id: int, limit: int = 50, dry_run: bool = True):
-
+def run_optimizer(
+    connected_seller_id: int = 1,
+    limit: int = 50,
+    dry_run: bool = True,
+    use_cost: bool = False,
+):
     cmd = [
         "python3",
         "-m",
         "etl.ml_campaign_optimizer",
-        "--connected-seller-id", str(connected_seller_id),
-        "--limit", str(limit)
+        "--connected-seller-id",
+        str(connected_seller_id),
+        "--limit",
+        str(limit),
+        "--use-cost",
+        "true" if use_cost else "false",
     ]
 
     if dry_run:
         cmd.append("--dry-run")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
+    csv_name = extract_csv_name(result.stdout)
 
-    return {
-        "status": "executado",
-        "stdout": result.stdout,
-        "stderr": result.stderr
-    }
+    return JSONResponse(
+        {
+            "status": "executado",
+            "connected_seller_id": connected_seller_id,
+            "limit": limit,
+            "dry_run": dry_run,
+            "use_cost": use_cost,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "csv_file": csv_name,
+        }
+    )
+
 
 @app.get("/run/full")
-def run_full(connected_seller_id: int):
-
-    import subprocess
-
+def run_full(
+    connected_seller_id: int = 1,
+    limit: int = 100,
+    dry_run: bool = True,
+    use_cost: bool = False,
+):
     results = {}
 
-    # 1. INVENTORY
     cmd_inventory = [
-        "python3", "-m", "etl.ml_inventory_snapshot_basic",
-        "--connected-seller-id", str(connected_seller_id),
-        "--limit-items", "100"
+        "python3",
+        "-m",
+        "etl.ml_inventory_snapshot_basic",
+        "--connected-seller-id",
+        str(connected_seller_id),
+        "--limit-items",
+        str(limit),
     ]
     r1 = subprocess.run(cmd_inventory, capture_output=True, text=True)
     results["inventory"] = r1.stdout or r1.stderr
 
-    # 2. REBATE
     cmd_rebate = [
-        "python3", "-m", "etl.ml_item_promo_rebate_snapshot",
-        "--connected-seller-id", str(connected_seller_id),
-        "--limit-items", "100"
+        "python3",
+        "-m",
+        "etl.ml_item_promo_rebate_snapshot",
+        "--connected-seller-id",
+        str(connected_seller_id),
+        "--limit-items",
+        str(limit),
     ]
     r2 = subprocess.run(cmd_rebate, capture_output=True, text=True)
     results["rebate"] = r2.stdout or r2.stderr
 
-    # 3. OPTIMIZER
     cmd_optimizer = [
-        "python3", "-m", "etl.ml_campaign_optimizer",
-        "--connected-seller-id", str(connected_seller_id),
-        "--limit", "100",
-        "--use-cost", "false"
+        "python3",
+        "-m",
+        "etl.ml_campaign_optimizer",
+        "--connected-seller-id",
+        str(connected_seller_id),
+        "--limit",
+        str(limit),
+        "--use-cost",
+        "true" if use_cost else "false",
     ]
+    if dry_run:
+        cmd_optimizer.append("--dry-run")
+
     r3 = subprocess.run(cmd_optimizer, capture_output=True, text=True)
     results["optimizer"] = r3.stdout or r3.stderr
 
-    return {
-        "status": "full run executado",
-        "results": results
-    }
+    csv_name = extract_csv_name(r3.stdout)
+
+    return JSONResponse(
+        {
+            "status": "full run executado",
+            "connected_seller_id": connected_seller_id,
+            "limit": limit,
+            "dry_run": dry_run,
+            "use_cost": use_cost,
+            "results": results,
+            "csv_file": csv_name,
+        }
+    )
+
+
+@app.get("/download/csv")
+def download_csv(filename: str):
+    base_dir = Path("/opt/render/project/src")
+    file_path = base_dir / filename
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="CSV não encontrado")
+
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="text/csv",
+    )
 
 
 @app.get("/painel", response_class=HTMLResponse)
-def painel(connected: int = 0):
-    status_msg = "❌ Não conectado"
+def painel(connected_seller_id: int = 1, connected: int = 0):
+    seller = get_connected_seller_summary(connected_seller_id)
 
+    if seller["connected"]:
+        status_html = f"""
+        <div class="status-card connected">
+            <div class="status-title">✅ Conectado</div>
+            <div class="status-line"><strong>Conta:</strong> {seller.get("seller_nickname") or "-"}</div>
+            <div class="status-line"><strong>ML User ID:</strong> {seller.get("ml_user_id") or "-"}</div>
+            <div class="status-line"><strong>Site:</strong> {seller.get("site_id") or "-"}</div>
+        </div>
+        """
+    else:
+        status_html = """
+        <div class="status-card disconnected">
+            <div class="status-title">❌ Não conectado</div>
+            <div class="status-line">Conecte sua conta do Mercado Livre para liberar a execução.</div>
+        </div>
+        """
+
+    connected_banner = ""
     if connected == 1:
-        status_msg = "✅ Conta conectada com sucesso"
+        connected_banner = """
+        <div class="flash success">
+            Conta conectada com sucesso.
+        </div>
+        """
 
     return f"""
     <html>
     <head>
         <title>Exos SaaS</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
+            * {{
+                box-sizing: border-box;
+            }}
             body {{
-                font-family: Arial;
-                background: #0f172a;
-                color: white;
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background: linear-gradient(180deg, #06122b 0%, #091a3f 100%);
+                color: #ffffff;
+            }}
+            .container {{
+                max-width: 980px;
+                margin: 0 auto;
+                padding: 40px 20px 60px;
+            }}
+            .hero {{
                 text-align: center;
-                padding: 50px;
+                margin-bottom: 28px;
             }}
-            button {{
-                padding: 15px 25px;
-                margin: 10px;
+            .hero h1 {{
+                font-size: 56px;
+                margin: 0 0 10px;
+                font-weight: 800;
+            }}
+            .hero p {{
+                font-size: 20px;
+                color: #d8e3ff;
+                margin: 0;
+            }}
+            .flash {{
+                max-width: 760px;
+                margin: 0 auto 20px;
+                padding: 14px 18px;
+                border-radius: 14px;
+                text-align: center;
+                font-weight: 700;
+            }}
+            .flash.success {{
+                background: rgba(34, 197, 94, 0.18);
+                border: 1px solid rgba(34, 197, 94, 0.35);
+                color: #d8ffe5;
+            }}
+            .grid {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+                align-items: start;
+            }}
+            .card {{
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 20px;
+                padding: 24px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.22);
+            }}
+            .card h2 {{
+                margin: 0 0 18px;
+                font-size: 28px;
+            }}
+            .status-card {{
+                border-radius: 16px;
+                padding: 18px;
+            }}
+            .status-card.connected {{
+                background: rgba(34, 197, 94, 0.14);
+                border: 1px solid rgba(34, 197, 94, 0.28);
+            }}
+            .status-card.disconnected {{
+                background: rgba(239, 68, 68, 0.12);
+                border: 1px solid rgba(239, 68, 68, 0.25);
+            }}
+            .status-title {{
+                font-size: 24px;
+                font-weight: 800;
+                margin-bottom: 10px;
+            }}
+            .status-line {{
                 font-size: 16px;
-                border: none;
-                border-radius: 8px;
-                cursor: pointer;
+                color: #e8eeff;
+                margin-top: 6px;
             }}
-            .btn-connect {{ background: #22c55e; }}
-            .btn-run {{ background: #3b82f6; }}
-            .box {{
-                margin-top: 30px;
-                padding: 20px;
-                background: #1e293b;
-                border-radius: 10px;
+            .actions {{
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                margin-top: 16px;
+            }}
+            .btn {{
+                width: 100%;
+                border: none;
+                border-radius: 14px;
+                padding: 16px 18px;
+                font-size: 18px;
+                font-weight: 700;
+                cursor: pointer;
+                transition: transform .05s ease, opacity .2s ease;
+            }}
+            .btn:hover {{
+                opacity: .94;
+            }}
+            .btn:active {{
+                transform: scale(0.99);
+            }}
+            .btn-connect {{
+                background: #22c55e;
+                color: #051b0d;
+            }}
+            .btn-primary {{
+                background: #3b82f6;
+                color: #ffffff;
+            }}
+            .btn-secondary {{
+                background: #0f172a;
+                color: #ffffff;
+                border: 1px solid rgba(255,255,255,0.15);
+            }}
+            .form-row {{
+                margin-bottom: 14px;
+                text-align: left;
+            }}
+            .form-row label {{
+                display: block;
+                margin-bottom: 8px;
+                font-weight: 700;
+                color: #dbe6ff;
+            }}
+            .form-inline {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                flex-wrap: wrap;
+            }}
+            input[type="number"] {{
+                width: 140px;
+                padding: 12px 14px;
+                border-radius: 12px;
+                border: none;
+                font-size: 18px;
+            }}
+            .check {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                font-size: 18px;
+                margin: 10px 0;
+            }}
+            .output-wrap {{
+                margin-top: 24px;
+            }}
+            .output-head {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+                flex-wrap: wrap;
+                margin-bottom: 10px;
+            }}
+            .download-area {{
+                display: none;
+            }}
+            .download-area.show {{
                 display: inline-block;
+            }}
+            pre {{
+                white-space: pre-wrap;
+                word-break: break-word;
+                text-align: left;
+                background: #020817;
+                color: #dbeafe;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 18px;
+                border-radius: 16px;
+                min-height: 180px;
+                max-height: 520px;
+                overflow: auto;
+                font-size: 13px;
+                line-height: 1.45;
+            }}
+            .muted {{
+                color: #9fb0d9;
+                font-size: 14px;
+                margin-top: 8px;
+            }}
+            @media (max-width: 820px) {{
+                .grid {{
+                    grid-template-columns: 1fr;
+                }}
+                .hero h1 {{
+                    font-size: 42px;
+                }}
             }}
         </style>
     </head>
     <body>
+        <div class="container">
+            <div class="hero">
+                <h1>🚀 Exos SaaS</h1>
+                <p>Otimize suas campanhas automaticamente com segurança</p>
+            </div>
 
-        <h1>🚀 Exos SaaS</h1>
-        <p>Otimize suas campanhas automaticamente</p>
+            {connected_banner}
 
-        <div class="box">
-            <p>{status_msg}</p>
+            <div class="grid">
+                <div class="card">
+                    <h2>Conta Mercado Livre</h2>
+                    {status_html}
+
+                    <div class="actions">
+                        <a href="/ml/oauth/start?connected_seller_id={connected_seller_id}">
+                            <button class="btn btn-connect">Conectar ou Reconectar Mercado Livre</button>
+                        </a>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Executar otimização</h2>
+
+                    <div class="form-row">
+                        <label for="connectedSellerId">Connected Seller ID</label>
+                        <input type="number" id="connectedSellerId" value="{connected_seller_id}" />
+                    </div>
+
+                    <div class="form-row">
+                        <label for="limit">Quantidade de anúncios</label>
+                        <input type="number" id="limit" value="50" />
+                    </div>
+
+                    <div class="check">
+                        <input type="checkbox" id="dryrun" checked />
+                        <label for="dryrun">Simulação (não altera campanhas)</label>
+                    </div>
+
+                    <div class="check">
+                        <input type="checkbox" id="usecost" />
+                        <label for="usecost">Usar custo do produto</label>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-primary" onclick="rodarOptimizer()">Rodar apenas optimizer</button>
+                        <button class="btn btn-secondary" onclick="rodarFull()">Rodar pipeline completo</button>
+                    </div>
+
+                    <div class="muted">
+                        Pipeline completo executa: inventory snapshot → rebate snapshot → optimizer
+                    </div>
+                </div>
+            </div>
+
+            <div class="output-wrap">
+                <div class="output-head">
+                    <h2>Resultado</h2>
+                    <div id="downloadArea" class="download-area">
+                        <a id="downloadLink" href="#" target="_blank">
+                            <button class="btn btn-secondary">Baixar CSV de auditoria</button>
+                        </a>
+                    </div>
+                </div>
+
+                <pre id="output">Nenhuma execução ainda.</pre>
+            </div>
         </div>
-
-        <br><br>
-
-        <a href="/ml/oauth/start?connected_seller_id=1">
-            <button class="btn-connect">Conectar Mercado Livre</button>
-        </a>
-
-        <br><br>
-
-        <div class="box">
-
-            <h3>Configuração</h3>
-
-            <label>
-                <input type="checkbox" id="dryrun" checked>
-                Simulação (não altera campanhas)
-            </label>
-
-            <br><br>
-
-            <label>Quantidade de anúncios:</label><br>
-            <input type="number" id="limit" value="50" style="padding:10px; width:100px">
-
-            <br><br>
-
-            <button class="btn-run" onclick="rodar()">Rodar Otimização</button>
-
-        </div>
-
-        <br><br>
-
-        <pre id="output"></pre>
 
         <script>
-            function rodar() {{
-                const dry = document.getElementById("dryrun").checked;
+            function getParams() {{
+                const connectedSellerId = document.getElementById("connectedSellerId").value;
                 const limit = document.getElementById("limit").value;
+                const dryRun = document.getElementById("dryrun").checked;
+                const useCost = document.getElementById("usecost").checked;
 
-                document.getElementById("output").innerText = "Executando...";
+                return {{
+                    connectedSellerId,
+                    limit,
+                    dryRun,
+                    useCost
+                }};
+            }}
 
-                fetch(`/run/optimizer?connected_seller_id=1&limit=${{limit}}&dry_run=${{dry}}`)
-                    .then(res => res.json())
-                    .then(data => {{
-                        document.getElementById("output").innerText =
-                            JSON.stringify(data, null, 2);
-                    }})
-                    .catch(err => {{
-                        document.getElementById("output").innerText = err;
-                    }});
+            function updateOutput(data) {{
+                document.getElementById("output").innerText = JSON.stringify(data, null, 2);
+
+                const downloadArea = document.getElementById("downloadArea");
+                const downloadLink = document.getElementById("downloadLink");
+
+                let csvFile = null;
+                if (data && data.csv_file) {{
+                    csvFile = data.csv_file;
+                }} else if (data && data.results && data.results.optimizer) {{
+                    const match = data.results.optimizer.match(/campaign_optimizer_audit_[0-9_]+\\.csv/);
+                    if (match) {{
+                        csvFile = match[0];
+                    }}
+                }}
+
+                if (csvFile) {{
+                    downloadLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`;
+                    downloadArea.classList.add("show");
+                }} else {{
+                    downloadArea.classList.remove("show");
+                    downloadLink.href = "#";
+                }}
+            }}
+
+            async function rodarOptimizer() {{
+                const p = getParams();
+                document.getElementById("output").innerText = "Executando optimizer...";
+
+                const url = `/run/optimizer?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
+
+                try {{
+                    const res = await fetch(url);
+                    const data = await res.json();
+                    updateOutput(data);
+                }} catch (err) {{
+                    document.getElementById("output").innerText = String(err);
+                }}
+            }}
+
+            async function rodarFull() {{
+                const p = getParams();
+                document.getElementById("output").innerText = "Executando pipeline completo...";
+
+                const url = `/run/full?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`;
+
+                try {{
+                    const res = await fetch(url);
+                    const data = await res.json();
+                    updateOutput(data);
+                }} catch (err) {{
+                    document.getElementById("output").innerText = String(err);
+                }}
             }}
         </script>
-
     </body>
     </html>
     """
