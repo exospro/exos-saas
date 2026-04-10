@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+from psycopg2.extras import Json, RealDictCursor, execute_values
+
+from etl.inventory.repository import db_connect, create_run, finish_run
+from etl.ml_auth_db_multi import get_headers
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
+
+DEFAULT_TIMEOUT = int(os.environ.get("ML_REBATE_SNAPSHOT_TIMEOUT_SEC", "60"))
+APP_VERSION = "v2"
+
+
+def to_decimal(value: Any):
+    from decimal import Decimal
+    try:
+        if value in (None, "", []):
+            return None
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def q2(value):
+    from decimal import Decimal, ROUND_HALF_UP
+    if value is None:
+        return None
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def q4(value):
+    from decimal import Decimal, ROUND_HALF_UP
+    if value is None:
+        return None
+    return value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+
+def normalize_percent(value: Any):
+    dec = to_decimal(value)
+    if dec is None:
+        return None
+    return dec / 100 if dec > 1 else dec
+
+
+def first_non_empty(obj: dict, keys: list[str]):
+    for key in keys:
+        val = obj.get(key)
+        if val not in (None, "", []):
+            return val
+    return None
+
+
+def _safe_json(resp: requests.Response):
+    try:
+        return resp.json()
+    except Exception:
+        return {"_raw": (resp.text or "").strip()[:4000]}
+
+
+def ensure_table(conn) -> None:
+    sql = """
+    CREATE SCHEMA IF NOT EXISTS ml;
+
+    CREATE TABLE IF NOT EXISTS ml.item_promo_rebate_snapshot (
+        id BIGSERIAL PRIMARY KEY,
+        connected_seller_id BIGINT NOT NULL,
+        collected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        run_id BIGINT,
+        mlb TEXT NOT NULL,
+        variation_id BIGINT,
+        promotion_id TEXT,
+        promotion_type TEXT,
+        promotion_status TEXT,
+        offer_id TEXT,
+        original_price NUMERIC(18,2),
+        promo_price NUMERIC(18,2),
+        discount_total NUMERIC(18,2),
+        meli_percent NUMERIC(10,4),
+        seller_percent NUMERIC(10,4),
+        rebate_meli_amount NUMERIC(18,2),
+        seller_discount_amount NUMERIC(18,2),
+        raw_json JSONB,
+        unexplained_discount_amount NUMERIC(18,2),
+        regular_amount_current NUMERIC(18,2),
+        sale_amount_current NUMERIC(18,2),
+        rebate_base_price NUMERIC(18,2),
+        rebate_price_source TEXT,
+        price_api_price_id TEXT,
+        price_api_reference_date TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_item_promo_rebate_snapshot_seller_run
+        ON ml.item_promo_rebate_snapshot (connected_seller_id, run_id);
+
+    CREATE INDEX IF NOT EXISTS ix_item_promo_rebate_snapshot_seller_mlb
+        ON ml.item_promo_rebate_snapshot (connected_seller_id, mlb);
+
+    CREATE INDEX IF NOT EXISTS ix_item_promo_rebate_snapshot_seller_mlb_var
+        ON ml.item_promo_rebate_snapshot (connected_seller_id, mlb, COALESCE(variation_id, -1));
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+
+def get_inventory_scope_rows(conn, connected_seller_id: int, source_run_id: int | None = None, limit_items: int | None = None):
+    sql = """
+    WITH inv_run AS (
+        SELECT COALESCE(
+            %(source_run_id)s::bigint,
+            (
+                SELECT max(id)
+                FROM ml.run
+                WHERE connected_seller_id = %(connected_seller_id)s
+                  AND run_type = 'inventory_snapshot'
+            ),
+            (
+                SELECT max(run_id)
+                FROM ml.inventory_snapshot_item
+                WHERE connected_seller_id = %(connected_seller_id)s
+            )
+        ) AS run_id
+    ),
+    base AS (
+        SELECT
+            i.mlb,
+            i.variation_id,
+            i.price,
+            i.effective_price,
+            i.promo_price,
+            i.promo_original_price
+        FROM ml.inventory_snapshot_item i
+        JOIN inv_run r ON r.run_id = i.run_id
+        WHERE i.connected_seller_id = %(connected_seller_id)s
+          AND i.mlb IS NOT NULL
+          AND COALESCE(i.status, '') = 'active'
+    ),
+    picked_items AS (
+        SELECT DISTINCT mlb
+        FROM base
+        ORDER BY mlb
+    )
+    SELECT
+        b.mlb,
+        b.variation_id,
+        b.price,
+        b.effective_price,
+        b.promo_price,
+        b.promo_original_price
+    FROM base b
+    JOIN picked_items p ON p.mlb = b.mlb
+    ORDER BY b.mlb, COALESCE(b.variation_id, -1)
+    """
+    if limit_items and limit_items > 0:
+        sql = """
+        WITH inv_run AS (
+            SELECT COALESCE(
+                %(source_run_id)s::bigint,
+                (
+                    SELECT max(id)
+                    FROM ml.run
+                    WHERE connected_seller_id = %(connected_seller_id)s
+                      AND run_type = 'inventory_snapshot'
+                ),
+                (
+                    SELECT max(run_id)
+                    FROM ml.inventory_snapshot_item
+                    WHERE connected_seller_id = %(connected_seller_id)s
+                )
+            ) AS run_id
+        ),
+        base AS (
+            SELECT
+                i.mlb,
+                i.variation_id,
+                i.price,
+                i.effective_price,
+                i.promo_price,
+                i.promo_original_price
+            FROM ml.inventory_snapshot_item i
+            JOIN inv_run r ON r.run_id = i.run_id
+            WHERE i.connected_seller_id = %(connected_seller_id)s
+              AND i.mlb IS NOT NULL
+              AND COALESCE(i.status, '') = 'active'
+        ),
+        picked_items AS (
+            SELECT DISTINCT mlb
+            FROM base
+            ORDER BY mlb
+            LIMIT %(limit_items)s
+        )
+        SELECT
+            b.mlb,
+            b.variation_id,
+            b.price,
+            b.effective_price,
+            b.promo_price,
+            b.promo_original_price
+        FROM base b
+        JOIN picked_items p ON p.mlb = b.mlb
+        ORDER BY b.mlb, COALESCE(b.variation_id, -1)
+        """
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            sql,
+            {
+                "connected_seller_id": connected_seller_id,
+                "source_run_id": source_run_id,
+                "limit_items": limit_items,
+            },
+        )
+        return list(cur.fetchall())
+
+
+def group_variations(rows: list[dict]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mlb = row["mlb"]
+        grouped.setdefault(
+            mlb,
+            {
+                "variation_ids": [],
+                "price": row.get("price"),
+                "effective_price": row.get("effective_price"),
+                "promo_price": row.get("promo_price"),
+                "promo_original_price": row.get("promo_original_price"),
+            },
+        )
+        grouped[mlb]["variation_ids"].append(row.get("variation_id"))
+    return grouped
+
+
+def item_promotions(session: requests.Session, connected_seller_id: int, item_id: str):
+    url = f"https://api.mercadolibre.com/seller-promotions/items/{item_id}"
+    params = {"app_version": APP_VERSION}
+    resp = session.get(
+        url,
+        headers=get_headers(connected_seller_id),
+        params=params,
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    if 200 <= resp.status_code < 300:
+        data = _safe_json(resp)
+        return {
+            "ok": True,
+            "item_id": item_id,
+            "promotions": data if isinstance(data, list) else [],
+            "error": None,
+        }
+
+    if resp.status_code == 404:
+        return {
+            "ok": True,
+            "item_id": item_id,
+            "promotions": [],
+            "error": None,
+        }
+
+    return {
+        "ok": False,
+        "item_id": item_id,
+        "promotions": [],
+        "error": {
+            "status_code": resp.status_code,
+            "reason": resp.reason,
+            "body": _safe_json(resp),
+        },
+    }
+
+
+def parse_promotion(item_ctx: dict[str, Any], promo: dict[str, Any]) -> dict[str, Any] | None:
+    promotion_id = str(first_non_empty(promo, ["promotion_id", "id"]) or "") or None
+    promotion_type = str(first_non_empty(promo, ["promotion_type", "type", "campaign_type"]) or "") or None
+    promotion_status = str(first_non_empty(promo, ["promotion_status", "status"]) or "") or None
+    offer_id = first_non_empty(
+        promo,
+        ["offer_id", "offerId", "promotion_offer_id", "candidate_offer_id", "smart_offer_id", "ref_id", "reference_id"],
+    )
+    offer_id = str(offer_id).strip() if offer_id not in (None, "", []) else None
+
+    original_price = to_decimal(first_non_empty(promo, ["original_price", "price_original", "regular_amount_current"]))
+    promo_price = to_decimal(first_non_empty(promo, ["promo_price", "price", "deal_price", "price_to_show", "offer_price"]))
+
+    if original_price is None:
+        original_price = to_decimal(item_ctx.get("promo_original_price")) or to_decimal(item_ctx.get("price"))
+
+    if promo_price is None:
+        promo_price = to_decimal(item_ctx.get("promo_price")) or to_decimal(item_ctx.get("effective_price")) or to_decimal(item_ctx.get("price"))
+
+    meli_percent = normalize_percent(first_non_empty(
+        promo,
+        ["meli_percent", "meli_percentage", "marketplace_percent", "meli_contribution_percent"],
+    ))
+    seller_percent = normalize_percent(first_non_empty(
+        promo,
+        ["seller_percent", "seller_percentage", "seller_contribution_percent"],
+    ))
+
+    discount_total = None
+    if original_price is not None and promo_price is not None:
+        discount_total = q2(original_price - promo_price)
+
+    rebate_meli_amount = None
+    if promo_price is not None and meli_percent is not None:
+        rebate_meli_amount = q2(promo_price * meli_percent)
+
+    seller_discount_amount = None
+    if promo_price is not None and seller_percent is not None:
+        seller_discount_amount = q2(promo_price * seller_percent)
+
+    unexplained_discount_amount = None
+    if discount_total is not None:
+        explained = (rebate_meli_amount or 0) + (seller_discount_amount or 0)
+        unexplained_discount_amount = q2(discount_total - explained)
+
+    regular_amount_current = to_decimal(first_non_empty(
+        promo,
+        ["regular_amount_current", "original_price", "price_original"],
+    ))
+    if regular_amount_current is None:
+        regular_amount_current = original_price
+
+    sale_amount_current = to_decimal(first_non_empty(
+        promo,
+        ["sale_amount_current", "promo_price", "price", "deal_price"],
+    ))
+    if sale_amount_current is None:
+        sale_amount_current = promo_price
+
+    rebate_base_price = promo_price or sale_amount_current
+    rebate_price_source = "promo_price" if promo_price is not None else "sale_amount_current"
+
+    price_api_price_id = first_non_empty(promo, ["price_id", "price_api_price_id"])
+    price_api_reference_date = first_non_empty(promo, ["reference_date", "price_api_reference_date", "start_date"])
+
+    return {
+        "promotion_id": promotion_id,
+        "promotion_type": promotion_type,
+        "promotion_status": promotion_status,
+        "offer_id": offer_id,
+        "original_price": q2(original_price),
+        "promo_price": q2(promo_price),
+        "discount_total": q2(discount_total),
+        "meli_percent": q4(meli_percent),
+        "seller_percent": q4(seller_percent),
+        "rebate_meli_amount": q2(rebate_meli_amount),
+        "seller_discount_amount": q2(seller_discount_amount),
+        "raw_json": promo,
+        "unexplained_discount_amount": q2(unexplained_discount_amount),
+        "regular_amount_current": q2(regular_amount_current),
+        "sale_amount_current": q2(sale_amount_current),
+        "rebate_base_price": q2(rebate_base_price),
+        "rebate_price_source": rebate_price_source,
+        "price_api_price_id": str(price_api_price_id).strip() if price_api_price_id not in (None, "", []) else None,
+        "price_api_reference_date": price_api_reference_date,
+    }
+
+
+def build_insert_rows(
+    connected_seller_id: int,
+    run_id: int,
+    grouped_items: dict[str, dict[str, Any]],
+    promotions_by_item: dict[str, list[dict[str, Any]]],
+) -> list[tuple]:
+    rows: list[tuple] = []
+
+    for mlb, item_ctx in grouped_items.items():
+        variation_ids = item_ctx["variation_ids"] or [None]
+        promotions = promotions_by_item.get(mlb, [])
+
+        if not promotions:
+            for variation_id in variation_ids:
+                rows.append(
+                    (
+                        connected_seller_id,
+                        run_id,
+                        mlb,
+                        variation_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        q2(to_decimal(item_ctx.get("promo_original_price")) or to_decimal(item_ctx.get("price"))),
+                        q2(to_decimal(item_ctx.get("promo_price")) or to_decimal(item_ctx.get("effective_price")) or to_decimal(item_ctx.get("price"))),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Json([]),
+                        None,
+                        q2(to_decimal(item_ctx.get("promo_original_price")) or to_decimal(item_ctx.get("price"))),
+                        q2(to_decimal(item_ctx.get("promo_price")) or to_decimal(item_ctx.get("effective_price")) or to_decimal(item_ctx.get("price"))),
+                        q2(to_decimal(item_ctx.get("promo_price")) or to_decimal(item_ctx.get("effective_price")) or to_decimal(item_ctx.get("price"))),
+                        "fallback_inventory",
+                        None,
+                        None,
+                    )
+                )
+            continue
+
+        for promo in promotions:
+            parsed = parse_promotion(item_ctx, promo)
+            if not parsed:
+                continue
+
+            for variation_id in variation_ids:
+                rows.append(
+                    (
+                        connected_seller_id,
+                        run_id,
+                        mlb,
+                        variation_id,
+                        parsed["promotion_id"],
+                        parsed["promotion_type"],
+                        parsed["promotion_status"],
+                        parsed["offer_id"],
+                        parsed["original_price"],
+                        parsed["promo_price"],
+                        parsed["discount_total"],
+                        parsed["meli_percent"],
+                        parsed["seller_percent"],
+                        parsed["rebate_meli_amount"],
+                        parsed["seller_discount_amount"],
+                        Json(parsed["raw_json"]),
+                        parsed["unexplained_discount_amount"],
+                        parsed["regular_amount_current"],
+                        parsed["sale_amount_current"],
+                        parsed["rebate_base_price"],
+                        parsed["rebate_price_source"],
+                        parsed["price_api_price_id"],
+                        parsed["price_api_reference_date"],
+                    )
+                )
+
+    return rows
+
+
+def insert_rows(conn, rows: list[tuple]) -> int:
+    if not rows:
+        return 0
+
+    sql = """
+    INSERT INTO ml.item_promo_rebate_snapshot (
+        connected_seller_id,
+        run_id,
+        mlb,
+        variation_id,
+        promotion_id,
+        promotion_type,
+        promotion_status,
+        offer_id,
+        original_price,
+        promo_price,
+        discount_total,
+        meli_percent,
+        seller_percent,
+        rebate_meli_amount,
+        seller_discount_amount,
+        raw_json,
+        unexplained_discount_amount,
+        regular_amount_current,
+        sale_amount_current,
+        rebate_base_price,
+        rebate_price_source,
+        price_api_price_id,
+        price_api_reference_date
+    ) VALUES %s
+    """
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=1000)
+    conn.commit()
+    return len(rows)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Coleta snapshot de promoções/rebate por item e grava em ml.item_promo_rebate_snapshot"
+    )
+    parser.add_argument("--connected-seller-id", type=int, required=True, help="ID do seller conectado em ml.connected_seller")
+    parser.add_argument("--source-run-id", type=int, default=None, help="run_id fonte do inventory_snapshot; default = último")
+    parser.add_argument("--limit-items", type=int, default=None, help="Limita quantidade de MLBs do snapshot")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    connected_seller_id = args.connected_seller_id
+    session = requests.Session()
+
+    with db_connect() as conn:
+        ensure_table(conn)
+
+        scope_rows = get_inventory_scope_rows(
+            conn,
+            connected_seller_id=connected_seller_id,
+            source_run_id=args.source_run_id,
+            limit_items=args.limit_items,
+        )
+        grouped_items = group_variations(scope_rows)
+
+        run_id = create_run(
+            conn,
+            connected_seller_id=connected_seller_id,
+            run_type="item_promo_rebate_snapshot",
+            status="running",
+            params={
+                "connected_seller_id": connected_seller_id,
+                "source_run_id": args.source_run_id,
+                "limit_items": args.limit_items,
+                "mlb_count": len(grouped_items),
+            },
+        )
+
+        try:
+            promotions_by_item: dict[str, list[dict[str, Any]]] = {}
+            failed_items: list[dict[str, Any]] = []
+
+            for mlb in grouped_items.keys():
+                result = item_promotions(session, connected_seller_id, mlb)
+
+                if result["ok"]:
+                    promotions_by_item[mlb] = result["promotions"]
+                else:
+                    promotions_by_item[mlb] = []
+                    failed_items.append(
+                        {
+                            "mlb": mlb,
+                            "error": result["error"],
+                        }
+                    )
+                    print(f"ERRO MLB {mlb}: {result['error']['status_code']} {result['error']['reason']}")
+
+            rows = build_insert_rows(
+                connected_seller_id=connected_seller_id,
+                run_id=run_id,
+                grouped_items=grouped_items,
+                promotions_by_item=promotions_by_item,
+            )
+            inserted = insert_rows(conn, rows)
+
+            finish_run(
+                conn,
+                run_id,
+                status="finished",
+                totals={
+                    "mlb_count": len(grouped_items),
+                    "scope_rows": len(scope_rows),
+                    "rows_inserted": inserted,
+                    "failed_items": len(failed_items),
+                },
+            )
+
+            print("REBATE SNAPSHOT OK")
+            print(
+                {
+                    "connected_seller_id": connected_seller_id,
+                    "run_id": run_id,
+                    "mlb_count": len(grouped_items),
+                    "scope_rows": len(scope_rows),
+                    "rows_inserted": inserted,
+                    "failed_items": len(failed_items),
+                }
+            )
+
+            if failed_items:
+                print(f"ITENS COM ERRO: {len(failed_items)}")
+                for err in failed_items[:20]:
+                    print(err)
+
+        except Exception as exc:
+            finish_run(conn, run_id, status="error", totals={}, error=str(exc))
+            raise
+
+
+if __name__ == "__main__":
+    main()
