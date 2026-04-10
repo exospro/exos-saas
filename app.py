@@ -84,6 +84,103 @@ def extract_csv_name(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+def parse_oauth_state(state: str | None) -> dict:
+    """
+    Estados aceitos:
+      - seller:new:<account_id>
+      - seller:<connected_seller_id>
+    """
+    if not state or not state.startswith("seller:"):
+        raise HTTPException(status_code=400, detail="Invalid state")
+
+    parts = state.split(":")
+
+    if len(parts) == 3 and parts[1] == "new" and parts[2].isdigit():
+        return {"mode": "new", "account_id": int(parts[2]), "connected_seller_id": None}
+
+    if len(parts) == 2 and parts[1].isdigit():
+        return {"mode": "existing", "account_id": None, "connected_seller_id": int(parts[1])}
+
+    raise HTTPException(status_code=400, detail="Invalid state payload")
+
+
+def create_connected_seller(
+    cur,
+    *,
+    account_id: int,
+    ml_user_id: int,
+    seller_nickname: str | None,
+    site_id: str | None,
+) -> int:
+    cur.execute(
+        """
+        INSERT INTO ml.connected_seller (
+            account_id,
+            ml_user_id,
+            seller_nickname,
+            site_id,
+            status,
+            authorized_at,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, 'active', now(), now())
+        RETURNING id
+        """,
+        (account_id, ml_user_id, seller_nickname, site_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=500, detail="Falha ao criar novo connected_seller")
+    return int(row["id"])
+
+
+def get_connected_seller_by_ml_user_id(cur, *, ml_user_id: int) -> dict | None:
+    cur.execute(
+        """
+        SELECT id, account_id
+        FROM ml.connected_seller
+        WHERE ml_user_id = %s
+        ORDER BY id
+        LIMIT 1
+        """,
+        (ml_user_id,),
+    )
+    return cur.fetchone()
+
+
+def update_connected_seller(
+    cur,
+    *,
+    connected_seller_id: int,
+    ml_user_id: int,
+    seller_nickname: str | None,
+    site_id: str | None,
+) -> int:
+    cur.execute(
+        """
+        UPDATE ml.connected_seller
+           SET ml_user_id = %s,
+               seller_nickname = %s,
+               site_id = %s,
+               status = 'active',
+               authorized_at = now(),
+               updated_at = now()
+         WHERE id = %s
+        RETURNING id
+        """,
+        (ml_user_id, seller_nickname, site_id, connected_seller_id),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"connected_seller_id {connected_seller_id} não encontrado",
+        )
+
+    return int(row["id"])
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/painel")
@@ -95,8 +192,13 @@ def health():
 
 
 @app.get("/ml/oauth/start")
-def start_oauth(connected_seller_id: int = 1):
-    state = f"seller:{connected_seller_id}"
+def start_oauth(connected_seller_id: int | None = None, account_id: int | None = None):
+    if connected_seller_id:
+        state = f"seller:{connected_seller_id}"
+    else:
+        if not account_id:
+            raise HTTPException(status_code=400, detail="account_id é obrigatório para conectar uma nova conta")
+        state = f"seller:new:{account_id}"
     params = {
         "response_type": "code",
         "client_id": ML_CLIENT_ID,
@@ -115,10 +217,7 @@ async def oauth_callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
-    if not state or not state.startswith("seller:"):
-        raise HTTPException(status_code=400, detail="Invalid state")
-
-    connected_seller_id = int(state.split(":")[1])
+    state_data = parse_oauth_state(state)
 
     token_resp = requests.post(
         TOKEN_URL,
@@ -161,26 +260,32 @@ async def oauth_callback(request: Request):
 
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                UPDATE ml.connected_seller
-                   SET ml_user_id = %s,
-                       seller_nickname = %s,
-                       site_id = %s,
-                       status = 'active',
-                       authorized_at = now(),
-                       updated_at = now()
-                 WHERE id = %s
-                RETURNING id
-                """,
-                (ml_user_id, seller_nickname, site_id, connected_seller_id),
-            )
-            row = cur.fetchone()
+            existing_seller = get_connected_seller_by_ml_user_id(cur, ml_user_id=ml_user_id)
 
-            if not row:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"connected_seller_id {connected_seller_id} não encontrado",
+            if state_data["mode"] == "new":
+                if existing_seller:
+                    connected_seller_id = update_connected_seller(
+                        cur,
+                        connected_seller_id=int(existing_seller["id"]),
+                        ml_user_id=ml_user_id,
+                        seller_nickname=seller_nickname,
+                        site_id=site_id,
+                    )
+                else:
+                    connected_seller_id = create_connected_seller(
+                        cur,
+                        account_id=state_data["account_id"],
+                        ml_user_id=ml_user_id,
+                        seller_nickname=seller_nickname,
+                        site_id=site_id,
+                    )
+            else:
+                connected_seller_id = update_connected_seller(
+                    cur,
+                    connected_seller_id=state_data["connected_seller_id"],
+                    ml_user_id=ml_user_id,
+                    seller_nickname=seller_nickname,
+                    site_id=site_id,
                 )
 
             cur.execute(
@@ -416,13 +521,14 @@ def download_csv(filename: str):
 
 
 @app.get("/painel", response_class=HTMLResponse)
-def painel(connected_seller_id: int = 1, connected: int = 0):
+def painel(connected_seller_id: int = 1, account_id: int = 1, connected: int = 0):
     seller = get_connected_seller_summary(connected_seller_id)
 
     if seller["connected"]:
         status_html = f"""
         <div class="status-card connected">
             <div class="status-title">✅ Conectado</div>
+            <div class="status-line"><strong>Connected Seller ID:</strong> {seller.get("connected_seller_id") or "-"}</div>
             <div class="status-line"><strong>Conta:</strong> {seller.get("seller_nickname") or "-"}</div>
             <div class="status-line"><strong>ML User ID:</strong> {seller.get("ml_user_id") or "-"}</div>
             <div class="status-line"><strong>Site:</strong> {seller.get("site_id") or "-"}</div>
@@ -432,15 +538,15 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
         status_html = """
         <div class="status-card disconnected">
             <div class="status-title">❌ Não conectado</div>
-            <div class="status-line">Conecte sua conta do Mercado Livre para liberar a execução.</div>
+            <div class="status-line">Conecte uma nova conta do Mercado Livre para criar um novo seller.</div>
         </div>
         """
 
     connected_banner = ""
     if connected == 1:
-        connected_banner = """
+        connected_banner = f"""
         <div class="flash success">
-            Conta conectada com sucesso.
+            Conta conectada com sucesso. Connected Seller ID criado/atualizado: {connected_seller_id}
         </div>
         """
 
@@ -653,9 +759,15 @@ def painel(connected_seller_id: int = 1, connected: int = 0):
                     <h2>Conta Mercado Livre</h2>
                     {status_html}
 
+                    <div class="form-row">
+                        <label for="accountId">Account ID</label>
+                        <input type="number" id="accountId" value="{account_id}" />
+                    </div>
+
                     <div class="actions">
+                        <button class="btn btn-connect" onclick="conectarNovaConta()">Conectar nova conta Mercado Livre</button>
                         <a href="/ml/oauth/start?connected_seller_id={connected_seller_id}">
-                            <button class="btn btn-connect">Conectar ou Reconectar Mercado Livre</button>
+                            <button class="btn btn-secondary">Reconectar seller atual</button>
                         </a>
                     </div>
                 </div>
