@@ -20,6 +20,10 @@ DEFAULT_TIMEOUT = int(os.environ.get("ML_REBATE_SNAPSHOT_TIMEOUT_SEC", "60"))
 APP_VERSION = "v2"
 
 
+def should_log_progress(index: int, total: int, step: int = 25) -> bool:
+    return index == 1 or index % step == 0 or index == total
+
+
 def to_decimal(value: Any):
     from decimal import Decimal
     try:
@@ -524,10 +528,13 @@ def main() -> None:
         )
 
         try:
+            print(f"[REBATE] Iniciando snapshot | connected_seller_id={connected_seller_id} | mlb_count={len(grouped_items)} | scope_rows={len(scope_rows)}")
             promotions_by_item: dict[str, list[dict[str, Any]]] = {}
             failed_items: list[dict[str, Any]] = []
+            mlbs = list(grouped_items.keys())
+            total_mlbs = len(mlbs)
 
-            for mlb in grouped_items.keys():
+            for idx, mlb in enumerate(mlbs, start=1):
                 result = item_promotions(session, connected_seller_id, mlb)
 
                 if result["ok"]:
@@ -540,8 +547,12 @@ def main() -> None:
                             "error": result["error"],
                         }
                     )
-                    print(f"ERRO MLB {mlb}: {result['error']['status_code']} {result['error']['reason']}")
+                    print(f"[REBATE][ERRO] mlb={mlb} | status={result['error']['status_code']} | reason={result['error']['reason']}")
 
+                if should_log_progress(idx, total_mlbs, step=25):
+                    print(f"[REBATE] {idx}/{total_mlbs} | mlb={mlb} | failed_items={len(failed_items)}")
+
+            print(f"[REBATE] Montando linhas para insert | promotions_by_item={len(promotions_by_item)}")
             rows = build_insert_rows(
                 connected_seller_id=connected_seller_id,
                 run_id=run_id,
@@ -562,6 +573,7 @@ def main() -> None:
                 },
             )
 
+            print(f"[REBATE] Finalizado | rows_inserted={inserted} | failed_items={len(failed_items)}")
             print("REBATE SNAPSHOT OK")
             print(
                 {

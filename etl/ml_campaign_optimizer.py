@@ -1192,8 +1192,14 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 else:
                     no_action += 1
 
-                if processed % 25 == 0 or processed == total_items:
-                    print(f"processed={processed}/{total_items} | switched={switched} | errors={errors} | no_action={no_action}")
+                current_mlb = row.get("mlb") or "-"
+                current_reason = row.get("reason") or "-"
+                current_status = row.get("execution_status") or "-"
+                if processed == 1 or processed % 25 == 0 or processed == total_items:
+                    print(
+                        f"[OPTIMIZER] {processed}/{total_items} | mlb={current_mlb} | status={current_status} | "
+                        f"reason={current_reason} | switched={switched} | errors={errors} | no_action={no_action}"
+                    )
 
                 if len(pending_rows) >= flush_every:
                     flush_logs()
@@ -1301,7 +1307,7 @@ def main():
     out_csv = args.out or f"campaign_optimizer_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
     print(
-        f"scope_items={len(items)} | dry_run={args.dry_run} | use_cost={use_cost} | tax_pct={tax_pct} | "
+        f"[OPTIMIZER] Iniciando | scope_items={len(items)} | dry_run={args.dry_run} | use_cost={use_cost} | tax_pct={tax_pct} | "
         f"min_margin_pct={min_margin_pct} | max_meli_rebate_pct={max_meli_rebate_pct} | mlb_filter={len(mlb_filter)}"
     )
 
@@ -1322,6 +1328,7 @@ def main():
         use_cost=use_cost,
         mlb_filter=mlb_filter or None,
     )
+    print(f"[OPTIMIZER] Finalizado | processed={result.get('processed')} | switched={result.get('switched')} | errors={result.get('errors')} | no_action={result.get('no_action')}")
     print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
 
 

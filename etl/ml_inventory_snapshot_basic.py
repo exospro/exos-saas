@@ -26,6 +26,10 @@ def get_headers(connected_seller_id: int) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def should_log_progress(index: int, total: int, step: int = 25) -> bool:
+    return index == 1 or index % step == 0 or index == total
+
+
 
 def _safe_json(resp: requests.Response) -> Any:
     try:
@@ -379,6 +383,7 @@ def main() -> None:
         )
 
         try:
+            print(f"[INVENTORY] Iniciando snapshot | connected_seller_id={connected_seller_id} | user_id={user_id}")
             item_ids = fetch_item_ids(
                 session,
                 connected_seller_id=connected_seller_id,
@@ -386,9 +391,11 @@ def main() -> None:
                 limit=args.page_size,
                 max_items=args.limit_items,
             )
+            print(f"[INVENTORY] IDs encontrados: {len(item_ids)}")
 
             items: list[dict[str, Any]] = []
-            for item_id in item_ids:
+            total_ids = len(item_ids)
+            for idx, item_id in enumerate(item_ids, start=1):
                 items.append(
                     fetch_item_detail(
                         session,
@@ -396,7 +403,10 @@ def main() -> None:
                         item_id=item_id,
                     )
                 )
+                if should_log_progress(idx, total_ids, step=25):
+                    print(f"[INVENTORY] detalhe {idx}/{total_ids} | mlb={item_id}")
 
+            print(f"[INVENTORY] Montando linhas para insert | items={len(items)}")
             rows = build_rows(
                 connected_seller_id=connected_seller_id,
                 run_id=run_id,
@@ -415,6 +425,7 @@ def main() -> None:
                 },
             )
 
+            print(f"[INVENTORY] Finalizado | rows_inserted={inserted}")
             print("SNAPSHOT OK")
             print(
                 {
