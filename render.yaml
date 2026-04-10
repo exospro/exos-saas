@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: exos-saas-web
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+
+  - type: worker
+    name: exos-saas-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 worker.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: ASYNC_JOB_POLL_INTERVAL_SEC
+        value: "5"
