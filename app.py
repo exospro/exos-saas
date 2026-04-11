@@ -1121,7 +1121,20 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             async function fetchText(url) {{ const res = await fetch(url); return await res.text(); }}
             function stopPolling() {{ if (pollingTimer) {{ clearInterval(pollingTimer); pollingTimer = null; }} }}
 
-            function badge(status) {{ return `<span class="badge ${{status}}">${{status}}</span>`; }}
+            function badgeHtml(status) {{
+                const s = (status || "").toLowerCase();
+                const label = (status || "-").toUpperCase();
+                return `<span class="badge ${{s}}">${{label}}</span>`;
+            }}
+
+            function fmtDate(value) {{
+                if (!value) return "-";
+                try {{
+                    return new Date(value).toLocaleString("pt-BR");
+                }} catch (e) {{
+                    return value;
+                }}
+            }}
 
             async function refreshRecentJobs() {{
                 try {{
@@ -1135,14 +1148,16 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     root.innerHTML = jobs.map(j => `
                         <div class="job-item">
                             <div class="job-head">
-                                <div><strong>${{j.job_type}}</strong> ${badge(j.status)}</div>
+                                <div><strong>${{j.job_type}}</strong> ${{badgeHtml(j.status)}}</div>
                                 <div>${{j.step || '-'}}</div>
                             </div>
                             <div style="margin-top:6px">${{j.summary?.headline || ''}}</div>
                             <div style="margin-top:6px; color:#9fb0d9">run_id=${{j.run_id}}</div>
-                            <div style="margin-top:4px; color:#9fb0d9">criado_em=${{j.created_at}}</div>
+                            <div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>
                             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
+                                <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
+                                <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
                                 ${{j.csv_file ? `<a target="_blank" href="/download/csv?filename=${{encodeURIComponent(j.csv_file)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
                             </div>
                         </div>
