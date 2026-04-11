@@ -1080,10 +1080,10 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
-                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Inventory async</button>
-                            <button class="btn btn-secondary" onclick="rodarRebateAsync()">Rebate async</button>
-                            <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Optimizer async</button>
-                            <button class="btn btn-connect" onclick="rodarFullAsync()">Pipeline completa async</button>
+                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar MLBs</button>
+                            <button class="btn btn-secondary" onclick="rodarRebateAsync()">Atualizar Rebate</button>
+                            <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Ativar Campanha Vencedora</button>
+                            <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar Otimização Completa</button>
                         </div>
                     </div>
                     <div class="muted">Modo recomendado para produção: sempre async. Execuções duplicadas para a mesma conta são bloqueadas.</div>
@@ -1106,8 +1106,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     <h2>Resultado / Log</h2>
                     <div id="downloadArea" class="download-area">
                         <a id="downloadCsvLink" href="#" target="_blank"><button class="btn btn-secondary" type="button">Baixar CSV</button></a>
-                        <a id="downloadLogLink" href="#" target="_blank"><button class="btn btn-secondary" type="button">Baixar LOG</button></a>
-                    </div>
+                                            </div>
                 </div>
                 <pre id="output">Nenhuma execução ainda.</pre>
             </div>
@@ -1140,18 +1139,14 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             function setOutput(text) {{ document.getElementById("output").innerText = text; }}
             function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
 
-            function setDownloads(csvFile, logFile, runId = null, hasCsv = false) {{
+            function setDownloads(csvFile, runId, hasCsv, statusValue) {{
                 const area = document.getElementById("downloadArea");
                 const csvLink = document.getElementById("downloadCsvLink");
-                const logLink = document.getElementById("downloadLogLink");
                 let show = false;
 
-                if (hasCsv && runId) {{
+                const finished = statusValue === "finished";
+                if (finished && hasCsv && runId) {{
                     csvLink.href = `/download/csv?run_id=${{encodeURIComponent(runId)}}`;
-                    csvLink.style.display = "inline-block";
-                    show = true;
-                }} else if (csvFile) {{
-                    csvLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`;
                     csvLink.style.display = "inline-block";
                     show = true;
                 }} else {{
@@ -1159,14 +1154,6 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     csvLink.href = "#";
                 }}
 
-                if (logFile) {{
-                    logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`;
-                    logLink.style.display = "inline-block";
-                    show = true;
-                }} else {{
-                    logLink.style.display = "none";
-                    logLink.href = "#";
-                }}
                 area.classList.toggle("show", show);
             }}
 
@@ -1260,7 +1247,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
                     setOutput(logText || JSON.stringify(status, null, 2));
                     setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
-                    setDownloads(status.csv_file, status.log_file, status.run_id, status.has_csv);
+                    setDownloads(status.csv_file, status.run_id, status.has_csv, status.status);
                     setSummary(status.summary);
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
@@ -1277,7 +1264,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const data = await fetchJson(url);
                     setOutput(JSON.stringify(data, null, 2));
                     setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.log_file || null, data.run_id || null, false);
+                    setDownloads(data.csv_file || null, data.run_id || null, false, "queued");
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
                     if (data.run_id) startPolling(data.run_id);
