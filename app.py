@@ -157,6 +157,7 @@ def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
                 SELECT
                     run_id, job_type, status, step, connected_seller_id,
                     limit_items, dry_run, use_cost, log_file, csv_file,
+                    (csv_content IS NOT NULL) AS has_csv,
                     error, created_at, started_at, finished_at, updated_at,
                     payload_json, result_json
                 FROM app.async_job
@@ -253,6 +254,7 @@ def get_job(run_id: str) -> dict:
                     result_json,
                     log_file,
                     csv_file,
+                    (csv_content IS NOT NULL) AS has_csv,
                     error,
                     created_at,
                     started_at,
@@ -473,7 +475,7 @@ def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) ->
     SELECT
         run_id, job_type, status, step, connected_seller_id,
         limit_items, dry_run, use_cost, payload_json, result_json,
-        log_file, csv_file, error, created_at, started_at, finished_at, updated_at
+        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv, error, created_at, started_at, finished_at, updated_at
     FROM app.async_job
     """
     params = []
@@ -1138,13 +1140,33 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             function setOutput(text) {{ document.getElementById("output").innerText = text; }}
             function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
 
-            function setDownloads(csvFile, logFile) {{
+            function setDownloads(csvFile, logFile, runId = null, hasCsv = false) {{
                 const area = document.getElementById("downloadArea");
                 const csvLink = document.getElementById("downloadCsvLink");
                 const logLink = document.getElementById("downloadLogLink");
                 let show = false;
-                if (csvFile) {{ csvLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`; csvLink.style.display = "inline-block"; show = true; }} else {{ csvLink.style.display = "none"; }}
-                if (logFile) {{ logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`; logLink.style.display = "inline-block"; show = true; }} else {{ logLink.style.display = "none"; }}
+
+                if (hasCsv && runId) {{
+                    csvLink.href = `/download/csv?run_id=${{encodeURIComponent(runId)}}`;
+                    csvLink.style.display = "inline-block";
+                    show = true;
+                }} else if (csvFile) {{
+                    csvLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`;
+                    csvLink.style.display = "inline-block";
+                    show = true;
+                }} else {{
+                    csvLink.style.display = "none";
+                    csvLink.href = "#";
+                }}
+
+                if (logFile) {{
+                    logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`;
+                    logLink.style.display = "inline-block";
+                    show = true;
+                }} else {{
+                    logLink.style.display = "none";
+                    logLink.href = "#";
+                }}
                 area.classList.toggle("show", show);
             }}
 
@@ -1225,7 +1247,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
                                 <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
-                                ${{j.csv_file ? `<a target="_blank" href="/download/csv?filename=${{encodeURIComponent(j.csv_file)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
+                                ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
@@ -1238,7 +1260,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
                     setOutput(logText || JSON.stringify(status, null, 2));
                     setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
-                    setDownloads(status.csv_file, status.log_file);
+                    setDownloads(status.csv_file, status.log_file, status.run_id, status.has_csv);
                     setSummary(status.summary);
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
@@ -1255,7 +1277,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const data = await fetchJson(url);
                     setOutput(JSON.stringify(data, null, 2));
                     setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.log_file || null);
+                    setDownloads(data.csv_file || null, data.log_file || null, data.run_id || null, false);
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
                     if (data.run_id) startPolling(data.run_id);
