@@ -1065,7 +1065,12 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                 </div>
                 <div class="card">
                     <h2>Executar otimização</h2>
-                    <div class="form-row"><label for="connectedSellerId">Connected Seller ID</label><input type="number" id="connectedSellerId" value="{connected_seller_id}" /></div>
+                    <div class="form-row">
+                        <label>Conta ativa</label>
+                        <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
+                        <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
+                        <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
+                    </div>
                     <div class="form-row"><label for="limitMode">Escopo</label><select id="limitMode" onchange="toggleLimitInput()"><option value="50">50 anúncios</option><option value="100">100 anúncios</option><option value="custom">Quantidade personalizada</option><option value="all">Todos os anúncios</option></select></div>
                     <div class="form-row" id="customLimitRow"><label for="limit">Quantidade personalizada</label><input type="number" id="limit" value="50" /></div>
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simulação (não altera campanhas)</label></div>
@@ -1079,7 +1084,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                             <button class="btn btn-connect" onclick="rodarFullAsync()">Pipeline completa async</button>
                         </div>
                     </div>
-                    <div class="muted">Modo recomendado para produção: sempre async. Jobs duplicados para o mesmo seller são bloqueados.</div>
+                    <div class="muted">Modo recomendado para produção: sempre async. Execuções duplicadas para a mesma conta são bloqueadas.</div>
                     <div class="muted" id="jobInfo"></div>
                     <div class="summary-card">
                         <div class="summary-title">Resumo amigável</div>
@@ -1133,33 +1138,13 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             function setOutput(text) {{ document.getElementById("output").innerText = text; }}
             function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
 
-            function setDownloads(csvFile, logFile, runId=null) {{
+            function setDownloads(csvFile, logFile) {{
                 const area = document.getElementById("downloadArea");
                 const csvLink = document.getElementById("downloadCsvLink");
                 const logLink = document.getElementById("downloadLogLink");
                 let show = false;
-
-                if (csvFile || runId) {{
-                    const href = runId
-                        ? `/download/csv?run_id=${{encodeURIComponent(runId)}}`
-                        : `/download/csv?filename=${{encodeURIComponent(csvFile)}}`;
-                    csvLink.href = href;
-                    csvLink.style.display = "inline-block";
-                    show = true;
-                }} else {{
-                    csvLink.style.display = "none";
-                    csvLink.href = "#";
-                }}
-
-                if (logFile) {{
-                    logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`;
-                    logLink.style.display = "inline-block";
-                    show = true;
-                }} else {{
-                    logLink.style.display = "none";
-                    logLink.href = "#";
-                }}
-
+                if (csvFile) {{ csvLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`; csvLink.style.display = "inline-block"; show = true; }} else {{ csvLink.style.display = "none"; }}
+                if (logFile) {{ logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`; logLink.style.display = "inline-block"; show = true; }} else {{ logLink.style.display = "none"; }}
                 area.classList.toggle("show", show);
             }}
 
@@ -1240,7 +1225,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
                                 <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
-                                ${{j.csv_file ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
+                                ${{j.csv_file ? `<a target="_blank" href="/download/csv?filename=${{encodeURIComponent(j.csv_file)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
@@ -1253,7 +1238,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
                     setOutput(logText || JSON.stringify(status, null, 2));
                     setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
-                    setDownloads(status.csv_file, status.log_file, status.run_id);
+                    setDownloads(status.csv_file, status.log_file);
                     setSummary(status.summary);
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
@@ -1270,7 +1255,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const data = await fetchJson(url);
                     setOutput(JSON.stringify(data, null, 2));
                     setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.log_file || null, data.run_id || null);
+                    setDownloads(data.csv_file || null, data.log_file || null);
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
                     if (data.run_id) startPolling(data.run_id);
