@@ -14,7 +14,7 @@ import requests
 from etl.inventory.repository import db_connect
 
 app = FastAPI()
-#..
+#.
 
 ML_CLIENT_ID = os.environ["ML_CLIENT_ID"]
 ML_CLIENT_SECRET = os.environ["ML_CLIENT_SECRET"]
@@ -32,6 +32,52 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ACTIVE_JOB_STATUSES = ("queued", "running")
 
+
+def get_job_csv_payload(run_id: str) -> dict | None:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT run_id, csv_file, csv_content, csv_mime_type, csv_bytes
+                FROM app.async_job
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_last: int = 1) -> int:
+    """
+    Mantém apenas os últimos jobs finalizados/erro do seller.
+    Não mexe em queued/running.
+    """
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT run_id,
+                           row_number() OVER (
+                               PARTITION BY connected_seller_id
+                               ORDER BY created_at DESC
+                           ) AS rn
+                    FROM app.async_job
+                    WHERE connected_seller_id = %s
+                      AND status IN ('finished', 'error')
+                      AND run_id <> %s
+                )
+                DELETE FROM app.async_job j
+                USING ranked r
+                WHERE j.run_id = r.run_id
+                  AND r.rn > %s
+                """,
+                (connected_seller_id, keep_run_id, keep_last),
+            )
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
 
 def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -856,13 +902,29 @@ def run_log(run_id: str):
 
     return PlainTextResponse(f"Sem log disponível ainda. status={job.get('status')} step={job.get('step')}")
 
-
 @app.get("/download/csv")
-def download_csv(filename: str):
-    file_path = CSV_DIR / filename
-    if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="CSV não encontrado")
-    return FileResponse(path=str(file_path), filename=filename, media_type="text/csv")
+def download_csv(filename: str | None = None, run_id: str | None = None):
+    # caminho 1: arquivo local no mesmo serviço
+    if filename:
+        file_path = CSV_DIR / filename
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(path=str(file_path), filename=filename, media_type="text/csv")
+
+    # caminho 2: fallback pelo banco (worker e web em serviços diferentes)
+    if run_id:
+        payload = get_job_csv_payload(run_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="run_id não encontrado")
+
+        csv_content = payload.get("csv_content")
+        csv_file = payload.get("csv_file") or "resultado.csv"
+        mime = payload.get("csv_mime_type") or "text/csv"
+
+        if csv_content:
+            headers = {"Content-Disposition": f'attachment; filename="{csv_file}"'}
+            return PlainTextResponse(csv_content, media_type=mime, headers=headers)
+
+    raise HTTPException(status_code=404, detail="CSV não encontrado")
 
 
 @app.get("/download/log")
@@ -1071,13 +1133,33 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             function setOutput(text) {{ document.getElementById("output").innerText = text; }}
             function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
 
-            function setDownloads(csvFile, logFile) {{
+            function setDownloads(csvFile, logFile, runId=null) {{
                 const area = document.getElementById("downloadArea");
                 const csvLink = document.getElementById("downloadCsvLink");
                 const logLink = document.getElementById("downloadLogLink");
                 let show = false;
-                if (csvFile) {{ csvLink.href = `/download/csv?filename=${{encodeURIComponent(csvFile)}}`; csvLink.style.display = "inline-block"; show = true; }} else {{ csvLink.style.display = "none"; }}
-                if (logFile) {{ logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`; logLink.style.display = "inline-block"; show = true; }} else {{ logLink.style.display = "none"; }}
+
+                if (csvFile || runId) {{
+                    const href = runId
+                        ? `/download/csv?run_id=${{encodeURIComponent(runId)}}`
+                        : `/download/csv?filename=${{encodeURIComponent(csvFile)}}`;
+                    csvLink.href = href;
+                    csvLink.style.display = "inline-block";
+                    show = true;
+                }} else {{
+                    csvLink.style.display = "none";
+                    csvLink.href = "#";
+                }}
+
+                if (logFile) {{
+                    logLink.href = `/download/log?filename=${{encodeURIComponent(logFile)}}`;
+                    logLink.style.display = "inline-block";
+                    show = true;
+                }} else {{
+                    logLink.style.display = "none";
+                    logLink.href = "#";
+                }}
+
                 area.classList.toggle("show", show);
             }}
 
@@ -1158,7 +1240,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
                                 <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
-                                ${{j.csv_file ? `<a target="_blank" href="/download/csv?filename=${{encodeURIComponent(j.csv_file)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
+                                ${{j.csv_file ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
@@ -1171,7 +1253,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
                     setOutput(logText || JSON.stringify(status, null, 2));
                     setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
-                    setDownloads(status.csv_file, status.log_file);
+                    setDownloads(status.csv_file, status.log_file, status.run_id);
                     setSummary(status.summary);
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
@@ -1188,7 +1270,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                     const data = await fetchJson(url);
                     setOutput(JSON.stringify(data, null, 2));
                     setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.log_file || null);
+                    setDownloads(data.csv_file || null, data.log_file || null, data.run_id || null);
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
                     if (data.run_id) startPolling(data.run_id);
