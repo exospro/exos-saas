@@ -450,6 +450,25 @@ def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) ->
     return out
 
 
+def badge(status: str | None) -> str:
+    status = (status or "").lower()
+
+    color_map = {
+        "queued": ("#1d4ed8", "#dbeafe"),
+        "running": ("#a16207", "#fef3c7"),
+        "finished": ("#166534", "#dcfce7"),
+        "error": ("#991b1b", "#fee2e2"),
+    }
+
+    bg, fg = color_map.get(status, ("#334155", "#e2e8f0"))
+    label = status.upper() if status else "N/A"
+
+    return (
+        f'<span style="display:inline-block; padding:4px 8px; '
+        f'border-radius:999px; font-size:12px; font-weight:700; '
+        f'background:{bg}; color:{fg};">{label}</span>'
+    )
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/painel")
