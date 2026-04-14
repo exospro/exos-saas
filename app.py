@@ -368,34 +368,65 @@ def delete_web_session(session_token: str | None) -> None:
 
 def render_login_page(error_message: str = "") -> str:
     error_html = f'<div class="login-error">{error_message}</div>' if error_message else ''
+    access_management_html = ""
+    if can_manage_access:
+        access_management_html = f"""
+            <div class="card" style="margin-top:20px;">
+                        <h2>Acessos da conta</h2>
+                        <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                        <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
+                                                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
+                            <div class="invite-row">
+                                <div>
+                                    <label for="inviteEmail">E-mail para liberar acesso</label>
+                                    <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
+                                </div>
+                                <div>
+                                    <label for="inviteRole">Perfil</label>
+                                    <select id="inviteRole">
+                                        <option value="owner">Owner</option>
+                                        <option value="admin">Admin</option>
+                                        <option value="viewer">Viewer</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="invite-list" id="inviteList">Carregando acessos...</div>
+                    </div>
+        
+        """
+
     return f"""
     <html>
     <head>
-        <title>Login | Exos SaaS</title>
+        <title>Entrar | Exos SaaS</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
             * {{ box-sizing: border-box; }}
-            body {{ margin:0; font-family: Arial, sans-serif; background: linear-gradient(180deg, #06122b 0%, #091a3f 100%); color:#fff; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }}
-            .login-card {{ width:100%; max-width:460px; background: rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.10); border-radius:24px; padding:28px; box-shadow: 0 12px 30px rgba(0,0,0,0.24); text-align:center; }}
-            .login-card h1 {{ margin:0 0 10px; font-size:34px; font-weight:800; }}
-            .login-card p {{ margin:0 0 18px; color:#d8e3ff; line-height:1.45; }}
-            .google-btn {{ display:inline-flex; align-items:center; justify-content:center; width:100%; border:none; border-radius:14px; padding:14px 16px; font-size:16px; font-weight:700; cursor:pointer; background:#ffffff; color:#111827; text-decoration:none; }}
-            .google-btn:hover {{ opacity:.96; }}
-            .login-error {{ margin-bottom:16px; padding:12px 14px; border-radius:12px; background: rgba(239,68,68,0.16); border:1px solid rgba(239,68,68,0.35); color:#fecaca; font-size:14px; }}
-            .muted {{ margin-top:14px; color:#9fb0d9; font-size:13px; }}
+            body {{ margin: 0; min-height: 100vh; display:flex; align-items:center; justify-content:center; font-family: Arial, sans-serif; background: linear-gradient(180deg, #06122b 0%, #091a3f 100%); color: #fff; }}
+            .card {{ width: min(92vw, 460px); background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.08); border-radius: 24px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,0.22); text-align:center; }}
+            h1 {{ margin: 0 0 10px; font-size: 34px; }}
+            p {{ color: #d8e3ff; line-height: 1.5; }}
+            .btn {{ display:inline-block; margin-top: 18px; width:100%; border:none; border-radius:16px; padding:16px 18px; font-size:18px; font-weight:700; background:#fff; color:#111827; text-decoration:none; }}
+            .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
+            .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         </style>
     </head>
     <body>
-        <div class="login-card">
-            <h1>Exos SaaS</h1>
-            <p>Entre com sua conta Google para acessar o painel de otimização de campanhas.</p>
+        <div class="card">
+            <h1>🚀 Exos SaaS</h1>
+            <p>Entre com sua conta Google para acessar sua área de otimização de campanhas do Mercado Livre.</p>
+            <a class="btn" href="/auth/google/start">Entrar com Google</a>
             {error_html}
-            <a class="google-btn" href="/auth/google/start">Fazer login com Google</a>
-            <div class="muted">Seu acesso precisa estar previamente liberado para a sua conta.</div>
+            <div class="muted">Acesso liberado somente para e-mails autorizados.</div>
         </div>
     </body>
     </html>
     """
+
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: str | None = None):
