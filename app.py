@@ -204,6 +204,58 @@ def upsert_user_account_from_google(profile: dict) -> dict:
     return dict(row)
 
 
+
+def auto_link_user_by_invite(user_account_id: int, email: str) -> list[int]:
+    email = (email or "").strip().lower()
+    if not email:
+        return []
+
+    linked_account_ids: list[int] = []
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, account_id, role
+                FROM app.account_user_invite
+                WHERE lower(email) = lower(%s)
+                  AND status = 'pending'
+                ORDER BY id
+                """,
+                (email,),
+            )
+            invites = cur.fetchall()
+
+            for invite in invites:
+                account_id = int(invite["account_id"])
+                role = invite["role"] or "owner"
+
+                cur.execute(
+                    """
+                    INSERT INTO app.account_user (account_id, user_account_id, role, created_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (account_id, user_account_id) DO NOTHING
+                    """,
+                    (account_id, user_account_id, role),
+                )
+
+                cur.execute(
+                    """
+                    UPDATE app.account_user_invite
+                    SET status = 'accepted',
+                        accepted_at = now(),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (invite["id"],),
+                )
+
+                linked_account_ids.append(account_id)
+
+        conn.commit()
+
+    return linked_account_ids
+
 def create_web_session(user_account_id: int) -> str:
     token = secrets.token_urlsafe(32)
     expires_at = utc_now() + timedelta(days=APP_SESSION_DAYS)
@@ -323,6 +375,9 @@ def auth_google_callback(request: Request):
         return RedirectResponse(url="/login?error=" + quote("Não foi possível ler o perfil do Google."))
 
     user = upsert_user_account_from_google(profile_resp.json())
+
+    # vincula automaticamente por convite/liberação prévia
+    auto_link_user_by_invite(int(user["id"]), user["email"])
 
     # acesso apenas para usuários vinculados a alguma conta
     account_ids = get_user_account_ids(int(user["id"]))
