@@ -371,7 +371,7 @@ def render_login_page(error_message: str = "") -> str:
     return f"""
     <html>
     <head>
-        <title>Entrar | Exos SaaS</title>
+        <title>Entrar | Exos Tools</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
             * {{ box-sizing: border-box; }}
@@ -386,7 +386,7 @@ def render_login_page(error_message: str = "") -> str:
     </head>
     <body>
         <div class="card">
-            <h1>🚀 Exos SaaS</h1>
+            <h1>🚀 Exos Tools</h1>
             <p>Entre com sua conta Google para acessar sua área de otimização de campanhas do Mercado Livre.</p>
             <a class="btn" href="/auth/google/start">Entrar com Google</a>
             {error_html}
@@ -1505,7 +1505,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     return f"""
     <html>
     <head>
-        <title>Exos SaaS</title>
+        <title>Exos Profit</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
             * {{ box-sizing: border-box; }}
@@ -1535,7 +1535,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .btn-danger {{ background: #ef4444; color: #fff; }}
             .form-row {{ margin-bottom: 14px; text-align: left; }}
             .form-row label {{ display: block; margin-bottom: 8px; font-weight: 700; color: #dbe6ff; }}
-            .input[type="number"] {{width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
+            input[type="number"] {{ width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
             .check {{ display: flex; align-items: center; gap: 10px; font-size: 18px; margin: 10px 0; }}
             .output-wrap {{ margin-top: 24px; }}
             .output-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }}
@@ -1563,7 +1563,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             #customLimitRow {{ display: none; }}
             a.button-link {{ text-decoration: none; display: block; }}
             .invite-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-top:12px; }}
-            .inviteRole {{
+            #inviteRole {{
                 width: 160px;
                 height: 40px;
                 padding: 0 12px;
@@ -1575,7 +1575,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 color: #111827;
             }}
 
-            .inviteEmail {{
+            #inviteEmail {{
                 width: 360px;
                 max-width: 100%;
                 height: 40px;
@@ -1593,7 +1593,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             }}
 
 
-            .invite-row input, .invite-row select {{ width:auto; min-width:220px; }}
+            .invite-row > div {{ display:flex; flex-direction:column; }}
+            .invite-row label {{ display:block; margin-bottom:6px; font-size:13px; font-weight:700; color:#dbe6ff; }}
+            #inviteEmail {{ width: 340px; max-width: 100%; height: 40px; padding: 0 12px; border-radius: 10px; border: none; font-size: 14px; line-height: 40px; }}
+            #inviteRole {{ width: 150px; height: 40px; padding: 0 12px; border-radius: 10px; border: none; font-size: 14px; line-height: 40px; background: #f8fafc; color: #111827; }}
             .invite-list {{ margin-top: 14px; }}
             .invite-item {{ padding: 10px 12px; border-radius: 12px; background: rgba(2,8,23,0.55); margin-bottom: 8px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center; }}
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
@@ -1609,7 +1612,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 <button class="btn btn-secondary" style="width:auto;" onclick="logout()">Sair</button>
             </div>
             <div class="hero">
-                <h1>🚀 Exos SaaS</h1>
+                <h1>🚀 Exos Tools</h1>
                 <p>Automação de campanhas do Mercado Livre com execução segura e histórico de jobs.</p>
                 <div class="muted" style="margin-top:10px;">Usuário: {user.get('full_name') or user.get('email')}</div>
                 <div style="margin-top:10px;"><button class="btn btn-secondary" style="width:auto; padding:10px 14px; font-size:14px;" onclick="logout()">Sair</button></div>
@@ -1649,10 +1652,9 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar Otimização Completa</button>
                         </div>
                     </div>
-                    <div class="muted">Modo recomendado para produção: sempre async. Execuções duplicadas para a mesma conta são bloqueadas.</div>
                     <div class="muted" id="jobInfo"></div>
                     <div class="summary-card">
-                        <div class="summary-title">Resumo amigável</div>
+                        <div class="summary-title">Resumo geral</div>
                         <div class="summary-headline" id="summaryHeadline">Nenhum job executado ainda.</div>
                         <div class="muted" id="summaryDetails"></div>
                         <div class="metrics">
@@ -1678,13 +1680,13 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div>
                             <label for="inviteRole">Perfil</label>
                             <select id="inviteRole">
-                                <option value="owner">Owner</option>
-                                <option value="admin">Admin</option>
-                                <option value="viewer">Viewer</option>
+                                <option value="owner">Dono</option>
+                                <option value="admin">Administrador</option>
+                                <option value="viewer">Somente leitura</option>
                             </select>
                         </div>
                         <div>
-                            <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
+                            <button class="btn btn-primary" style="width:auto; height:40px; padding:0 18px; font-size:14px;" onclick="criarConvite()">Liberar acesso</button>
                         </div>
                     </div>
                 </div>
