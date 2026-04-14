@@ -6,7 +6,8 @@ import time
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
+import secrets
 from psycopg2.extras import Json, RealDictCursor
 
 import requests
@@ -19,10 +20,18 @@ app = FastAPI()
 ML_CLIENT_ID = os.environ["ML_CLIENT_ID"]
 ML_CLIENT_SECRET = os.environ["ML_CLIENT_SECRET"]
 ML_REDIRECT_URI = os.environ["ML_REDIRECT_URI"]
+GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+GOOGLE_REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]
+APP_SESSION_COOKIE_NAME = os.environ.get("APP_SESSION_COOKIE_NAME", "exos_saas_session")
+APP_SESSION_DAYS = int(os.environ.get("APP_SESSION_DAYS", "30"))
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 ME_URL = "https://api.mercadolibre.com/users/me"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 BASE_DIR = Path("/opt/render/project/src")
 CSV_DIR = BASE_DIR / "runtime_csv"
@@ -31,6 +40,317 @@ CSV_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ACTIVE_JOB_STATUSES = ("queued", "running")
+
+
+def get_session_user(request: Request) -> dict | None:
+    token = request.cookies.get(APP_SESSION_COOKIE_NAME)
+    if not token:
+        return None
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    u.id,
+                    u.email,
+                    u.full_name,
+                    u.google_sub,
+                    u.picture_url,
+                    u.status
+                FROM app.web_session s
+                JOIN app.user_account u
+                  ON u.id = s.user_account_id
+                WHERE s.session_token = %s
+                  AND s.expires_at > now()
+                  AND u.status = 'active'
+                """,
+                (token,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def require_user(request: Request) -> dict:
+    user = get_session_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Você precisa fazer login para acessar esta área.")
+    return user
+
+
+def get_user_account_ids(user_account_id: int) -> list[int]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT account_id
+                FROM app.account_user
+                WHERE user_account_id = %s
+                """,
+                (user_account_id,),
+            )
+            rows = cur.fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def get_accessible_connected_sellers(user_account_id: int) -> list[dict]:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id AS connected_seller_id,
+                    cs.account_id,
+                    cs.ml_user_id,
+                    cs.seller_nickname,
+                    cs.site_id,
+                    cs.status,
+                    cs.authorized_at
+                FROM ml.connected_seller cs
+                JOIN app.account_user au
+                  ON au.account_id = cs.account_id
+                WHERE au.user_account_id = %s
+                ORDER BY cs.created_at DESC
+                """,
+                (user_account_id,),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_default_connected_seller_id_for_user(user_account_id: int) -> int | None:
+    sellers = get_accessible_connected_sellers(user_account_id)
+    return int(sellers[0]["connected_seller_id"]) if sellers else None
+
+
+def require_connected_seller_access(user_account_id: int, connected_seller_id: int) -> dict:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    cs.id AS connected_seller_id,
+                    cs.account_id,
+                    cs.ml_user_id,
+                    cs.seller_nickname,
+                    cs.site_id,
+                    cs.status
+                FROM ml.connected_seller cs
+                JOIN app.account_user au
+                  ON au.account_id = cs.account_id
+                WHERE au.user_account_id = %s
+                  AND cs.id = %s
+                """,
+                (user_account_id, connected_seller_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=403, detail="Você não tem acesso a esta conta.")
+    return dict(row)
+
+
+def require_run_access(user_account_id: int, run_id: str) -> dict:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT j.run_id, j.connected_seller_id, cs.account_id
+                FROM app.async_job j
+                JOIN ml.connected_seller cs
+                  ON cs.id = j.connected_seller_id
+                JOIN app.account_user au
+                  ON au.account_id = cs.account_id
+                WHERE au.user_account_id = %s
+                  AND j.run_id = %s
+                """,
+                (user_account_id, run_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=403, detail="Você não tem acesso a este job.")
+    return dict(row)
+
+
+def upsert_user_account_from_google(profile: dict) -> dict:
+    email = (profile.get("email") or "").strip().lower()
+    full_name = profile.get("name")
+    google_sub = profile.get("sub")
+    picture_url = profile.get("picture")
+
+    if not email or not google_sub:
+        raise HTTPException(status_code=400, detail="Não foi possível identificar o usuário do Google.")
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO app.user_account (
+                    email, full_name, google_sub, picture_url, status, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, 'active', now(), now())
+                ON CONFLICT (email)
+                DO UPDATE SET
+                    full_name = EXCLUDED.full_name,
+                    google_sub = EXCLUDED.google_sub,
+                    picture_url = EXCLUDED.picture_url,
+                    updated_at = now()
+                RETURNING id, email, full_name, google_sub, picture_url, status
+                """,
+                (email, full_name, google_sub, picture_url),
+            )
+            row = cur.fetchone()
+        conn.commit()
+
+    return dict(row)
+
+
+def create_web_session(user_account_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = utc_now() + timedelta(days=APP_SESSION_DAYS)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app.web_session (session_token, user_account_id, expires_at, created_at)
+                VALUES (%s, %s, %s, now())
+                """,
+                (token, user_account_id, expires_at),
+            )
+        conn.commit()
+    return token
+
+
+def delete_web_session(session_token: str | None) -> None:
+    if not session_token:
+        return
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM app.web_session WHERE session_token = %s", (session_token,))
+        conn.commit()
+
+
+def render_login_page(error_message: str = "") -> str:
+    error_html = f'<div class="login-error">{error_message}</div>' if error_message else ''
+    return f"""
+    <html>
+    <head>
+        <title>Entrar | Exos SaaS</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+            * {{ box-sizing: border-box; }}
+            body {{ margin: 0; min-height: 100vh; display:flex; align-items:center; justify-content:center; font-family: Arial, sans-serif; background: linear-gradient(180deg, #06122b 0%, #091a3f 100%); color: #fff; }}
+            .card {{ width: min(92vw, 460px); background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.08); border-radius: 24px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,0.22); text-align:center; }}
+            h1 {{ margin: 0 0 10px; font-size: 34px; }}
+            p {{ color: #d8e3ff; line-height: 1.5; }}
+            .btn {{ display:inline-block; margin-top: 18px; width:100%; border:none; border-radius:16px; padding:16px 18px; font-size:18px; font-weight:700; background:#fff; color:#111827; text-decoration:none; }}
+            .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
+            .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🚀 Exos SaaS</h1>
+            <p>Entre com sua conta Google para acessar sua área de otimização de campanhas do Mercado Livre.</p>
+            <a class="btn" href="/auth/google/start">Entrar com Google</a>
+            {error_html}
+            <div class="muted">Acesso liberado somente para e-mails autorizados.</div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(error: str | None = None):
+    return render_login_page(error or "")
+
+
+@app.get("/auth/google/start")
+def auth_google_start(request: Request):
+    state = secrets.token_urlsafe(24)
+    return_to = request.query_params.get("return_to", "/painel")
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "online",
+        "include_granted_scopes": "true",
+        "prompt": "select_account",
+        "state": state,
+    }
+    response = RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
+    response.set_cookie("google_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600)
+    response.set_cookie("post_login_redirect", return_to, httponly=True, secure=True, samesite="lax", max_age=600)
+    return response
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    state_cookie = request.cookies.get("google_oauth_state")
+    return_to = request.cookies.get("post_login_redirect") or "/painel"
+
+    if not code or not state or not state_cookie or state != state_cookie:
+        return RedirectResponse(url="/login?error=" + quote("Falha na autenticação com Google."))
+
+    token_resp = requests.post(
+        GOOGLE_TOKEN_URL,
+        data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+        },
+        timeout=30,
+    )
+    if token_resp.status_code != 200:
+        return RedirectResponse(url="/login?error=" + quote("Não foi possível concluir o login com Google."))
+
+    access_token = token_resp.json().get("access_token")
+    if not access_token:
+        return RedirectResponse(url="/login?error=" + quote("Google não retornou token de acesso."))
+
+    profile_resp = requests.get(
+        GOOGLE_USERINFO_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if profile_resp.status_code != 200:
+        return RedirectResponse(url="/login?error=" + quote("Não foi possível ler o perfil do Google."))
+
+    user = upsert_user_account_from_google(profile_resp.json())
+
+    # acesso apenas para usuários vinculados a alguma conta
+    account_ids = get_user_account_ids(int(user["id"]))
+    if not account_ids:
+        return RedirectResponse(url="/login?error=" + quote("Seu e-mail ainda não foi liberado para acessar o sistema."))
+
+    session_token = create_web_session(int(user["id"]))
+    response = RedirectResponse(url=return_to)
+    response.set_cookie(
+        APP_SESSION_COOKIE_NAME,
+        session_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=APP_SESSION_DAYS * 24 * 60 * 60,
+    )
+    response.delete_cookie("google_oauth_state")
+    response.delete_cookie("post_login_redirect")
+    return response
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request):
+    token = request.cookies.get(APP_SESSION_COOKIE_NAME)
+    delete_web_session(token)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(APP_SESSION_COOKIE_NAME)
+    return response
 
 
 def get_job_csv_payload(run_id: str) -> dict | None:
@@ -518,8 +838,9 @@ def badge(status: str | None) -> str:
     )
 
 @app.get("/")
-def root():
-    return RedirectResponse(url="/painel")
+def root(request: Request):
+    user = get_session_user(request)
+    return RedirectResponse(url="/painel" if user else "/login")
 
 
 @app.get("/health")
@@ -680,7 +1001,9 @@ async def oauth_callback(request: Request):
 
 
 @app.get("/run/inventory")
-def run_inventory(connected_seller_id: int = 1, limit: int = 0):
+def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     cmd = build_inventory_cmd(connected_seller_id, limit)
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -698,7 +1021,9 @@ def run_inventory(connected_seller_id: int = 1, limit: int = 0):
 
 
 @app.get("/run/rebate")
-def run_rebate(connected_seller_id: int = 1, limit: int = 0):
+def run_rebate(request: Request, connected_seller_id: int = 1, limit: int = 0):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     cmd = build_rebate_cmd(connected_seller_id, limit)
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -716,7 +1041,9 @@ def run_rebate(connected_seller_id: int = 1, limit: int = 0):
 
 
 @app.get("/run/optimizer")
-def run_optimizer(connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+def run_optimizer(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     csv_path = build_csv_path()
     cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path)
@@ -737,7 +1064,9 @@ def run_optimizer(connected_seller_id: int = 1, limit: int = 0, dry_run: bool = 
 
 
 @app.get("/run/full")
-def run_full(connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+def run_full(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     results = {}
     r1 = subprocess.run(build_inventory_cmd(connected_seller_id, limit), capture_output=True, text=True)
@@ -771,7 +1100,9 @@ def async_ok_response(message: str, run_id: str, connected_seller_id: int, limit
 
 
 @app.get("/run/inventory_async")
-def run_inventory_async(connected_seller_id: int = 1, limit: int = 0):
+def run_inventory_async(request: Request, connected_seller_id: int = 1, limit: int = 0):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     log_path = build_log_path("inventory_run")
     run_id = insert_job(
         job_type="inventory",
@@ -787,7 +1118,9 @@ def run_inventory_async(connected_seller_id: int = 1, limit: int = 0):
 
 
 @app.get("/run/rebate_async")
-def run_rebate_async(connected_seller_id: int = 1, limit: int = 0):
+def run_rebate_async(request: Request, connected_seller_id: int = 1, limit: int = 0):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     log_path = build_log_path("rebate_run")
     run_id = insert_job(
         job_type="rebate",
@@ -803,7 +1136,9 @@ def run_rebate_async(connected_seller_id: int = 1, limit: int = 0):
 
 
 @app.get("/run/optimizer_async")
-def run_optimizer_async(connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     log_path = build_log_path("optimizer_run")
     csv_path = build_csv_path()
     run_id = insert_job(
@@ -829,7 +1164,9 @@ def run_optimizer_async(connected_seller_id: int = 1, limit: int = 0, dry_run: b
 
 
 @app.get("/run/full_async")
-def run_full_async(connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     log_path = build_log_path("full_pipeline")
     csv_path = build_csv_path()
     run_id = insert_job(
@@ -859,12 +1196,16 @@ def run_full_async(connected_seller_id: int = 1, limit: int = 0, dry_run: bool =
 
 
 @app.get("/run/status")
-def run_status(run_id: str):
+def run_status(request: Request, run_id: str):
+    user = require_user(request)
+    require_run_access(int(user["id"]), run_id)
     return get_job(run_id)
 
 
 @app.get("/run/log")
-def run_log(run_id: str):
+def run_log(request: Request, run_id: str):
+    user = require_user(request)
+    require_run_access(int(user["id"]), run_id)
     job = get_job(run_id)
 
     log_file = job.get("log_file")
@@ -905,7 +1246,10 @@ def run_log(run_id: str):
     return PlainTextResponse(f"Sem log disponível ainda. status={job.get('status')} step={job.get('step')}")
 
 @app.get("/download/csv")
-def download_csv(filename: str | None = None, run_id: str | None = None):
+def download_csv(request: Request, filename: str | None = None, run_id: str | None = None):
+    user = require_user(request)
+    if run_id:
+        require_run_access(int(user["id"]), run_id)
     # caminho 1: arquivo local no mesmo serviço
     if filename:
         file_path = CSV_DIR / filename
@@ -930,7 +1274,8 @@ def download_csv(filename: str | None = None, run_id: str | None = None):
 
 
 @app.get("/download/log")
-def download_log(filename: str):
+def download_log(request: Request, filename: str):
+    user = require_user(request)
     file_path = LOG_DIR / filename
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Log não encontrado")
@@ -938,12 +1283,19 @@ def download_log(filename: str):
 
 
 @app.get("/jobs/recent")
-def recent_jobs(limit: int = 20, connected_seller_id: int | None = None):
+def recent_jobs(request: Request, limit: int = 20, connected_seller_id: int | None = None):
+    user = require_user(request)
+    if connected_seller_id is not None:
+        require_connected_seller_access(int(user["id"]), connected_seller_id)
+    else:
+        connected_seller_id = get_default_connected_seller_id_for_user(int(user["id"]))
     return {"jobs": recent_jobs_rows(limit=limit, connected_seller_id=connected_seller_id)}
 
 
 @app.get("/jobs/active")
-def active_job(connected_seller_id: int):
+def active_job(request: Request, connected_seller_id: int):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
     active = get_active_job_for_seller(connected_seller_id)
     if not active:
         return {"active": None}
@@ -952,7 +1304,15 @@ def active_job(connected_seller_id: int):
 
 
 @app.get("/painel", response_class=HTMLResponse)
-def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | None = None):
+def painel(request: Request, connected_seller_id: int | None = None, connected: int = 0, account_id: int | None = None):
+    user = require_user(request)
+    accessible_sellers = get_accessible_connected_sellers(int(user["id"]))
+    if not accessible_sellers:
+        return HTMLResponse("<h1>Acesso não liberado</h1><p>Seu e-mail ainda não está vinculado a nenhuma conta.</p>", status_code=403)
+    if connected_seller_id is None:
+        connected_seller_id = int(accessible_sellers[0]["connected_seller_id"])
+    else:
+        require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
 
     if seller["connected"]:
@@ -1049,6 +1409,8 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             <div class="hero">
                 <h1>🚀 Exos SaaS</h1>
                 <p>Automação de campanhas do Mercado Livre com execução segura e histórico de jobs.</p>
+                <div class="muted" style="margin-top:10px;">Usuário: {user.get('full_name') or user.get('email')}</div>
+                <div style="margin-top:10px;"><button class="btn btn-secondary" style="width:auto; padding:10px 14px; font-size:14px;" onclick="logout()">Sair</button></div>
             </div>
             {connected_banner}
             <div class="grid">
@@ -1233,6 +1595,7 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
                             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
+                                <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
                                 ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
                             </div>
                         </div>
@@ -1277,6 +1640,11 @@ def painel(connected_seller_id: int = 1, connected: int = 0, account_id: int | N
             async function rodarRebateAsync() {{ const p = getParams(); await runAsync(`/run/rebate_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando rebate..."); }}
             async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando optimizer..."); }}
             async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando pipeline completa..."); }}
+
+            async function logout() {{
+                await fetch("/auth/logout", {{ method: "POST" }});
+                window.location.href = "/login";
+            }}
 
             toggleLimitInput();
             refreshRecentJobs();
