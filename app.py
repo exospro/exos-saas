@@ -1487,7 +1487,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             <div class="status-line"><strong>Conta:</strong> {seller.get('seller_nickname') or '-'}</div>
             <div class="status-line"><strong>ML User ID:</strong> {seller.get('ml_user_id') or '-'}</div>
             <div class="status-line"><strong>Site:</strong> {seller.get('site_id') or '-'}</div>
-            <div class="status-line"><strong>Connected Seller ID:</strong> {seller.get('connected_seller_id') or '-'}</div>
         </div>
         """
     else:
@@ -1499,11 +1498,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
         """
 
     connected_banner = '<div class="flash success">Conta conectada com sucesso.</div>' if connected == 1 else ''
-    account_hint = (
-        f'<div class="muted">Contexto da conta carregado. Account ID interno: {account_id}</div>'
-        if account_id else '<div class="muted" style="color:#ffd7d7;">Para conectar nova conta, abra este painel com ?account_id=SEU_ID.</div>'
-    )
-    new_connect_href = f"/ml/oauth/start?account_id={account_id}" if account_id else "#"
+    #new_connect_href = f"/ml/oauth/start?account_id={account_id}" if account_id else "#"
+    new_connect_href = f"/login" 
     reconnect_href = f"/ml/oauth/start?connected_seller_id={connected_seller_id}"
 
     return f"""
