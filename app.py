@@ -368,6 +368,37 @@ def delete_web_session(session_token: str | None) -> None:
 
 def render_login_page(error_message: str = "") -> str:
     error_html = f'<div class="login-error">{error_message}</div>' if error_message else ''
+    access_management_html = ""
+    if can_manage_access:
+        access_management_html = f"""
+            <div class="card" style="margin-top:20px;">
+                        <h2>Acessos da conta</h2>
+                        <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                        <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
+                                                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
+                            <div class="invite-row">
+                                <div>
+                                    <label for="inviteEmail">E-mail para liberar acesso</label>
+                                    <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
+                                </div>
+                                <div>
+                                    <label for="inviteRole">Perfil</label>
+                                    <select id="inviteRole">
+                                        <option value="owner">Owner</option>
+                                        <option value="admin">Admin</option>
+                                        <option value="viewer">Viewer</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="invite-list" id="inviteList">Carregando acessos...</div>
+                    </div>
+        
+        """
+
     return f"""
     <html>
     <head>
@@ -382,7 +413,76 @@ def render_login_page(error_message: str = "") -> str:
             .btn {{ display:inline-block; margin-top: 18px; width:100%; border:none; border-radius:16px; padding:16px 18px; font-size:18px; font-weight:700; background:#fff; color:#111827; text-decoration:none; }}
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
-        </style>
+        
+/* === PREMIUM ACCESS UI === */
+input[type="email"], select {
+    height: 42px;
+    padding: 0 12px;
+    border-radius: 10px;
+    border: none;
+    font-size: 14px;
+    outline: none;
+}
+
+input[type="email"] {
+    min-width: 260px;
+}
+
+select {
+    min-width: 140px;
+    background-color: #f1f5f9;
+    color: #111827;
+    font-weight: 600;
+}
+
+.invite-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+}
+
+.invite-row label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #c7d2fe;
+    margin-bottom: 6px;
+    display: block;
+}
+
+.btn-primary {
+    height: 42px;
+    padding: 0 18px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+}
+
+.role-badge {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.role-owner {
+    background: rgba(34,197,94,0.2);
+    color: #86efac;
+}
+
+.role-admin {
+    background: rgba(59,130,246,0.2);
+    color: #bfdbfe;
+}
+
+.role-viewer {
+    background: rgba(148,163,184,0.2);
+    color: #e2e8f0;
+}
+
+</style>
     </head>
     <body>
         <div class="card">
@@ -1540,7 +1640,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .btn-danger {{ background: #ef4444; color: #fff; }}
             .form-row {{ margin-bottom: 14px; text-align: left; }}
             .form-row label {{ display: block; margin-bottom: 8px; font-weight: 700; color: #dbe6ff; }}
-            input[type="number"], select {{ width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
+            input[type="number"], input[type="email"] {{ width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
             .check {{ display: flex; align-items: center; gap: 10px; font-size: 18px; margin: 10px 0; }}
             .output-wrap {{ margin-top: 24px; }}
             .output-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }}
@@ -1575,7 +1675,76 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
-        </style>
+        
+/* === PREMIUM ACCESS UI === */
+input[type="email"], select {
+    height: 42px;
+    padding: 0 12px;
+    border-radius: 10px;
+    border: none;
+    font-size: 14px;
+    outline: none;
+}
+
+input[type="email"] {
+    min-width: 260px;
+}
+
+select {
+    min-width: 140px;
+    background-color: #f1f5f9;
+    color: #111827;
+    font-weight: 600;
+}
+
+.invite-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+}
+
+.invite-row label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #c7d2fe;
+    margin-bottom: 6px;
+    display: block;
+}
+
+.btn-primary {
+    height: 42px;
+    padding: 0 18px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+}
+
+.role-badge {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.role-owner {
+    background: rgba(34,197,94,0.2);
+    color: #86efac;
+}
+
+.role-admin {
+    background: rgba(59,130,246,0.2);
+    color: #bfdbfe;
+}
+
+.role-viewer {
+    background: rgba(148,163,184,0.2);
+    color: #e2e8f0;
+}
+
+</style>
     </head>
     <body>
         <div class="container">
@@ -1640,32 +1809,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                 </div>
             </div>
-            <div class="card" style="margin-top:20px;">
-                <h2>Acessos da conta</h2>
-                <input type="hidden" id="currentAccountId" value="{current_account_id}" />
-                <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
-                {'' if can_manage_access else '<div class="muted" style="color:#fde68a;">Você não tem permissão para gerenciar acessos desta conta.</div>'}
-                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
-                    <div class="invite-row">
-                        <div>
-                            <label for="inviteEmail">E-mail para liberar acesso</label>
-                            <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
-                        </div>
-                        <div>
-                            <label for="inviteRole">Perfil</label>
-                            <select id="inviteRole">
-                                <option value="owner">Owner</option>
-                                <option value="admin">Admin</option>
-                                <option value="viewer">Viewer</option>
-                            </select>
-                        </div>
-                        <div>
-                            <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
-                        </div>
-                    </div>
-                </div>
-                <div class="invite-list" id="inviteList">Carregando acessos...</div>
-            </div>
+            {access_management_html}
             <div class="output-wrap">
                 <div class="output-head">
                     <h2>Resultado / Log</h2>
