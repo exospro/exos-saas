@@ -368,6 +368,38 @@ def delete_web_session(session_token: str | None) -> None:
 
 def render_login_page(error_message: str = "") -> str:
     error_html = f'<div class="login-error">{error_message}</div>' if error_message else ''
+    access_management_html = ""
+    if can_manage_access:
+        access_management_html = f"""
+            <div class="card" style="margin-top:20px;">
+                        <h2>Acessos da conta</h2>
+                <div class="muted">Convide e gerencie quem pode acessar esta conta.</div>
+                        <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                        <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
+                                                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
+                            <div class="invite-row">
+                                <div>
+                                    <label for="inviteEmail">E-mail para liberar acesso</label>
+                                    <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
+                                </div>
+                                <div>
+                                    <label for="inviteRole">Perfil</label>
+                                    <select id="inviteRole">
+                                        <option value="owner">Dono</option>
+                                        <option value="admin">Administrador</option>
+                                        <option value="viewer">Somente leitura</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Convidar usuário</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="invite-list" id="inviteList">Carregando acessos...</div>
+                    </div>
+        
+        """
+
     return f"""
     <html>
     <head>
@@ -1574,7 +1606,18 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
-            @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
+            .invite-row { display:grid; grid-template-columns: 1.7fr 1fr auto; gap:14px; align-items:end; margin-top:14px; }
+            .invite-row > div { min-width: 0; }
+            .invite-row label { display:block; margin-bottom:6px; font-size:14px; font-weight:700; color:#dbe6ff; }
+            .invite-row input[type="email"], .invite-row select { width:100%; height:42px; padding:10px 12px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); background:rgba(2,8,23,0.75); color:#ffffff; font-size:14px; line-height:1.2; outline:none; box-shadow:none; }
+            .invite-row input[type="email"]::placeholder { color:#8fa3cf; }
+            .invite-row input[type="email"]:focus, .invite-row select:focus { border-color: rgba(59,130,246,0.65); box-shadow: 0 0 0 3px rgba(59,130,246,0.18); }
+            .invite-list { margin-top:16px; }
+            .invite-item { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:12px 14px; border-radius:12px; background:rgba(2,8,23,0.55); margin-bottom:10px; }
+            .invite-item-main { min-width:0; }
+            .invite-email { font-weight:700; color:#ffffff; }
+            .invite-meta { margin-top:4px; font-size:12px; color:#9fb0d9; }
+            @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } .small-grid { grid-template-columns: 1fr; } .metrics { grid-template-columns: 1fr 1fr; } .hero h1 { font-size: 40px; } .invite-row { grid-template-columns: 1fr; } } {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
         </style>
     </head>
     <body>
@@ -1640,32 +1683,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                 </div>
             </div>
-            <div class="card" style="margin-top:20px;">
-                <h2>Acessos da conta</h2>
-                <input type="hidden" id="currentAccountId" value="{current_account_id}" />
-                <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
-                {'' if can_manage_access else '<div class="muted" style="color:#fde68a;">Você não tem permissão para gerenciar acessos desta conta.</div>'}
-                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
-                    <div class="invite-row">
-                        <div>
-                            <label for="inviteEmail">E-mail para liberar acesso</label>
-                            <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
-                        </div>
-                        <div>
-                            <label for="inviteRole">Perfil</label>
-                            <select id="inviteRole">
-                                <option value="owner">Owner</option>
-                                <option value="admin">Admin</option>
-                                <option value="viewer">Viewer</option>
-                            </select>
-                        </div>
-                        <div>
-                            <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
-                        </div>
-                    </div>
-                </div>
-                <div class="invite-list" id="inviteList">Carregando acessos...</div>
-            </div>
+            {access_management_html}
             <div class="output-wrap">
                 <div class="output-head">
                     <h2>Resultado / Log</h2>
@@ -1805,7 +1823,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     await fetchJson(url, {{ method: 'POST' }});
                     document.getElementById('inviteEmail').value = '';
                     await refreshInvites();
-                    alert('Acesso liberado com sucesso.');
+                    alert('Convite salvo com sucesso.');
                 }} catch (e) {{
                     alert(String(e));
                 }}
