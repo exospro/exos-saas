@@ -1445,7 +1445,7 @@ def download_csv(request: Request, filename: str | None = None, run_id: str | No
     user = require_user(request)
     if run_id:
         require_run_access(int(user["id"]), run_id)
-    # caminho 1: arquivo local no mesmo serviço
+    # caminho 1: arquivo local no mesmo serviço.
     if filename:
         file_path = CSV_DIR / filename
         if file_path.exists() and file_path.is_file():
