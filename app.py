@@ -368,37 +368,6 @@ def delete_web_session(session_token: str | None) -> None:
 
 def render_login_page(error_message: str = "") -> str:
     error_html = f'<div class="login-error">{error_message}</div>' if error_message else ''
-    access_management_html = ""
-    if can_manage_access:
-        access_management_html = f"""
-            <div class="card" style="margin-top:20px;">
-                        <h2>Acessos da conta</h2>
-                        <input type="hidden" id="currentAccountId" value="{current_account_id}" />
-                        <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
-                                                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
-                            <div class="invite-row">
-                                <div>
-                                    <label for="inviteEmail">E-mail para liberar acesso</label>
-                                    <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
-                                </div>
-                                <div>
-                                    <label for="inviteRole">Perfil</label>
-                                    <select id="inviteRole">
-                                        <option value="owner">Owner</option>
-                                        <option value="admin">Admin</option>
-                                        <option value="viewer">Viewer</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="invite-list" id="inviteList">Carregando acessos...</div>
-                    </div>
-        
-        """
-
     return f"""
     <html>
     <head>
@@ -1671,7 +1640,32 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                 </div>
             </div>
-            {access_management_html}
+            <div class="card" style="margin-top:20px;">
+                <h2>Acessos da conta</h2>
+                <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
+                {'' if can_manage_access else '<div class="muted" style="color:#fde68a;">Você não tem permissão para gerenciar acessos desta conta.</div>'}
+                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
+                    <div class="invite-row">
+                        <div>
+                            <label for="inviteEmail">E-mail para liberar acesso</label>
+                            <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
+                        </div>
+                        <div>
+                            <label for="inviteRole">Perfil</label>
+                            <select id="inviteRole">
+                                <option value="owner">Owner</option>
+                                <option value="admin">Admin</option>
+                                <option value="viewer">Viewer</option>
+                            </select>
+                        </div>
+                        <div>
+                            <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="invite-list" id="inviteList">Carregando acessos...</div>
+            </div>
             <div class="output-wrap">
                 <div class="output-head">
                     <h2>Resultado / Log</h2>
