@@ -1589,7 +1589,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 <div class="card">
                     <h2>Conta Mercado Livre</h2>
                     {status_html}
-                    {account_hint}
                     <div class="actions">
                         <a class="button-link" href="{new_connect_href}" onclick="return validarNovaConta();"><button class="btn btn-connect" type="button">Conectar nova conta Mercado Livre</button></a>
                         <a class="button-link" href="{reconnect_href}"><button class="btn btn-secondary" type="button">Reconectar seller atual</button></a>
