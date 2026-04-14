@@ -1535,7 +1535,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .btn-danger {{ background: #ef4444; color: #fff; }}
             .form-row {{ margin-bottom: 14px; text-align: left; }}
             .form-row label {{ display: block; margin-bottom: 8px; font-weight: 700; color: #dbe6ff; }}
-            input[type="number"], select {{ width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
+            .input[type="number"] {{width: 220px; padding: 12px 14px; border-radius: 12px; border: none; font-size: 18px; }}
             .check {{ display: flex; align-items: center; gap: 10px; font-size: 18px; margin: 10px 0; }}
             .output-wrap {{ margin-top: 24px; }}
             .output-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }}
@@ -1563,6 +1563,36 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             #customLimitRow {{ display: none; }}
             a.button-link {{ text-decoration: none; display: block; }}
             .invite-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-top:12px; }}
+            .inviteRole {{
+                width: 160px;
+                height: 40px;
+                padding: 0 12px;
+                border-radius: 10px;
+                border: none;
+                font-size: 14px;
+                line-height: 40px;
+                background: #f8fafc;
+                color: #111827;
+            }}
+
+            .inviteEmail {{
+                width: 360px;
+                max-width: 100%;
+                height: 40px;
+                padding: 0 12px;
+                border-radius: 10px;
+                border: none;
+                font-size: 14px;
+                line-height: 40px;
+            }}
+
+            .invite-row button {{
+                height: 40px;
+                padding: 0 18px;
+                font-size: 14px;
+            }}
+
+
             .invite-row input, .invite-row select {{ width:auto; min-width:220px; }}
             .invite-list {{ margin-top: 14px; }}
             .invite-item {{ padding: 10px 12px; border-radius: 12px; background: rgba(2,8,23,0.55); margin-bottom: 8px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center; }}
