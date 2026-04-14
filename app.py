@@ -93,6 +93,90 @@ def get_user_account_ids(user_account_id: int) -> list[int]:
     return [int(r[0]) for r in rows]
 
 
+def get_user_role_for_account(user_account_id: int, account_id: int) -> str | None:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT role
+                FROM app.account_user
+                WHERE user_account_id = %s
+                  AND account_id = %s
+                LIMIT 1
+                """,
+                (user_account_id, account_id),
+            )
+            row = cur.fetchone()
+    return row["role"] if row else None
+
+
+def require_account_role(user_account_id: int, account_id: int, allowed_roles: tuple[str, ...] = ("owner", "admin")) -> str:
+    role = get_user_role_for_account(user_account_id, account_id)
+    if not role or role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Você não tem permissão para gerenciar acessos desta conta.")
+    return role
+
+
+def list_account_invites(account_id: int) -> list[dict]:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, account_id, email, role, status, invited_at, accepted_at, created_at, updated_at
+                FROM app.account_user_invite
+                WHERE account_id = %s
+                ORDER BY created_at DESC
+                """,
+                (account_id,),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_or_update_account_invite(account_id: int, email: str, role: str) -> dict:
+    email = (email or "").strip().lower()
+    role = (role or "viewer").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Informe um e-mail válido.")
+    if role not in ("owner", "admin", "viewer"):
+        raise HTTPException(status_code=400, detail="Role inválido.")
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO app.account_user_invite (account_id, email, role, status, invited_at, created_at, updated_at)
+                VALUES (%s, %s, %s, 'pending', now(), now(), now())
+                ON CONFLICT (account_id, email) DO UPDATE
+                SET role = EXCLUDED.role,
+                    status = 'pending',
+                    accepted_at = NULL,
+                    updated_at = now()
+                RETURNING id, account_id, email, role, status, invited_at, accepted_at, created_at, updated_at
+                """,
+                (account_id, email, role),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return dict(row)
+
+
+def revoke_account_invite(account_id: int, invite_id: int) -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE app.account_user_invite
+                SET status = 'revoked',
+                    updated_at = now()
+                WHERE id = %s
+                  AND account_id = %s
+                """,
+                (invite_id, account_id),
+            )
+        conn.commit()
+
+
 def get_accessible_connected_sellers(user_account_id: int) -> list[dict]:
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -406,6 +490,30 @@ def auth_logout(request: Request):
     response = JSONResponse({"ok": True})
     response.delete_cookie(APP_SESSION_COOKIE_NAME)
     return response
+
+
+@app.get("/account/invites")
+def account_invites(request: Request, account_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id)
+    invites = list_account_invites(account_id)
+    return {"invites": invites}
+
+
+@app.post("/account/invites/create")
+def account_invites_create(request: Request, account_id: int, email: str, role: str = "viewer"):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id)
+    invite = create_or_update_account_invite(account_id, email, role)
+    return {"ok": True, "invite": invite}
+
+
+@app.post("/account/invites/revoke")
+def account_invites_revoke(request: Request, account_id: int, invite_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id)
+    revoke_account_invite(account_id, invite_id)
+    return {"ok": True}
 
 
 def get_job_csv_payload(run_id: str) -> dict | None:
@@ -1369,6 +1477,9 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     else:
         require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
+    current_account_id = int(seller.get("account_id") or accessible_sellers[0]["account_id"])
+    current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
+    can_manage_access = current_user_role in ("owner", "admin")
 
     if seller["connected"]:
         status_html = f"""
@@ -1456,11 +1567,22 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .warn-box {{ display:none; margin-top: 10px; padding: 12px 14px; border-radius: 12px; background: rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.28); color:#fde68a; }}
             #customLimitRow {{ display: none; }}
             a.button-link {{ text-decoration: none; display: block; }}
+            .invite-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-top:12px; }}
+            .invite-row input, .invite-row select {{ width:auto; min-width:220px; }}
+            .invite-list {{ margin-top: 14px; }}
+            .invite-item {{ padding: 10px 12px; border-radius: 12px; background: rgba(2,8,23,0.55); margin-bottom: 8px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center; }}
+            .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
+            .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
+            .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
         </style>
     </head>
     <body>
         <div class="container">
+            <div class="topbar">
+                <div class="user-pill">Logado como: {user.get('email')}</div>
+                <button class="btn btn-secondary" style="width:auto;" onclick="logout()">Sair</button>
+            </div>
             <div class="hero">
                 <h1>🚀 Exos SaaS</h1>
                 <p>Automação de campanhas do Mercado Livre com execução segura e histórico de jobs.</p>
@@ -1517,6 +1639,32 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         </div>
                     </div>
                 </div>
+            </div>
+            <div class="card" style="margin-top:20px;">
+                <h2>Acessos da conta</h2>
+                <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                <div class="muted">Conta atual: {seller.get('seller_nickname') or '-'} | Perfil: {current_user_role or '-'}</div>
+                {'' if can_manage_access else '<div class="muted" style="color:#fde68a;">Você não tem permissão para gerenciar acessos desta conta.</div>'}
+                <div id="inviteManager" {'style="display:none;"' if not can_manage_access else ''}>
+                    <div class="invite-row">
+                        <div>
+                            <label for="inviteEmail">E-mail para liberar acesso</label>
+                            <input type="email" id="inviteEmail" placeholder="cliente@gmail.com" />
+                        </div>
+                        <div>
+                            <label for="inviteRole">Perfil</label>
+                            <select id="inviteRole">
+                                <option value="owner">Owner</option>
+                                <option value="admin">Admin</option>
+                                <option value="viewer">Viewer</option>
+                            </select>
+                        </div>
+                        <div>
+                            <button class="btn btn-primary" style="width:auto;" onclick="criarConvite()">Liberar acesso</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="invite-list" id="inviteList">Carregando acessos...</div>
             </div>
             <div class="output-wrap">
                 <div class="output-head">
@@ -1595,8 +1743,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 box.innerText = `Já existe job em andamento: ${{active.job_type}} | status=${{active.status}} | etapa=${{active.step || '-'}} | run_id=${{active.run_id}}`;
             }}
 
-            async function fetchJson(url) {{
-                const res = await fetch(url);
+            async function fetchJson(url, options = undefined) {{
+                const res = await fetch(url, options);
                 const text = await res.text();
                 try {{
                     const data = JSON.parse(text);
@@ -1613,6 +1761,67 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
             async function fetchText(url) {{ const res = await fetch(url); return await res.text(); }}
             function stopPolling() {{ if (pollingTimer) {{ clearInterval(pollingTimer); pollingTimer = null; }} }}
+
+            async function logout() {{
+                await fetch('/auth/logout', {{ method: 'POST' }});
+                window.location.href = '/login';
+            }}
+
+            async function refreshInvites() {{
+                const accountId = document.getElementById('currentAccountId')?.value;
+                const root = document.getElementById('inviteList');
+                if (!accountId || !root) return;
+                try {{
+                    const data = await fetchJson(`/account/invites?account_id=${{encodeURIComponent(accountId)}}`);
+                    const invites = data.invites || [];
+                    if (!invites.length) {{
+                        root.innerHTML = '<div class="muted">Nenhum acesso liberado ainda.</div>';
+                        return;
+                    }}
+                    root.innerHTML = invites.map(i => `
+                        <div class="invite-item">
+                            <div>
+                                <div><strong>${{i.email}}</strong> — ${{(i.role || '-').toUpperCase()}}</div>
+                                <div class="invite-meta">status=${{i.status}} | criado em ${{fmtDate(i.created_at)}}${{i.accepted_at ? ` | aceito em ${{fmtDate(i.accepted_at)}}` : ''}}</div>
+                            </div>
+                            ${{i.status !== 'revoked' ? `<button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="revogarConvite(${{i.id}})">Revogar</button>` : ''}}
+                        </div>
+                    `).join('');
+                }} catch (e) {{
+                    root.innerHTML = `<div class="muted">${{String(e)}}</div>`;
+                }}
+            }}
+
+            async function criarConvite() {{
+                const accountId = document.getElementById('currentAccountId').value;
+                const email = (document.getElementById('inviteEmail').value || '').trim();
+                const role = document.getElementById('inviteRole').value;
+                if (!email) {{
+                    alert('Informe o e-mail do usuário.');
+                    return;
+                }}
+                try {{
+                    const url = `/account/invites/create?account_id=${{encodeURIComponent(accountId)}}&email=${{encodeURIComponent(email)}}&role=${{encodeURIComponent(role)}}`;
+                    await fetchJson(url, {{ method: 'POST' }});
+                    document.getElementById('inviteEmail').value = '';
+                    await refreshInvites();
+                    alert('Acesso liberado com sucesso.');
+                }} catch (e) {{
+                    alert(String(e));
+                }}
+            }}
+
+            async function revogarConvite(inviteId) {{
+                const accountId = document.getElementById('currentAccountId').value;
+                if (!confirm('Revogar este acesso?')) return;
+                try {{
+                    const url = `/account/invites/revoke?account_id=${{encodeURIComponent(accountId)}}&invite_id=${{encodeURIComponent(inviteId)}}`;
+                    await fetchJson(url, {{ method: 'POST' }});
+                    await refreshInvites();
+                }} catch (e) {{
+                    alert(String(e));
+                }}
+            }}
 
             function badgeHtml(status) {{
                 const s = (status || "").toLowerCase();
@@ -1703,6 +1912,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
             toggleLimitInput();
             refreshRecentJobs();
+            refreshInvites();
         </script>
     </body>
     </html>
