@@ -1418,7 +1418,7 @@ def download_csv(request: Request, filename: str | None = None, run_id: str | No
         if file_path.exists() and file_path.is_file():
             return FileResponse(path=str(file_path), filename=filename, media_type="text/csv")
 
-    # caminho 2: fallback pelo banco (worker e web em serviços diferentes)
+    # caminho 2: fallback pelo banco (worker e web em serviços diferentes).
     if run_id:
         payload = get_job_csv_payload(run_id)
         if not payload:
