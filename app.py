@@ -202,15 +202,19 @@ def get_today_usage(account_id: int) -> dict:
     }
 
 
-def validate_plan_access(account_id: int, requested_limit: int) -> dict:
+def validate_plan_access(account_id: int, requested_limit: int, enforce_mlb_limit: bool = True) -> dict:
     """
     Bloqueia qualquer passo caso:
       - não exista assinatura ativa/trial
       - trial tenha expirado
-      - status esteja fora dos statuses vivos
       - limite diário de execuções já tenha sido atingido
-      - requested_limit ultrapasse o limite do plano
-      - requested_limit == 0 em plano com mlb_limit definido
+
+    Quando enforce_mlb_limit=True:
+      - requested_limit precisa respeitar o mlb_limit do plano
+      - requested_limit == 0 é bloqueado em planos com limite definido
+
+    Quando enforce_mlb_limit=False:
+      - não trava pela quantidade de MLBs, útil para inventory
     """
     subscription = get_or_create_subscription(account_id)
     if not subscription:
@@ -230,7 +234,7 @@ def validate_plan_access(account_id: int, requested_limit: int) -> dict:
     mlb_limit = subscription["mlb_limit"]
     daily_limit = int(subscription["daily_execution_limit"] or 0)
 
-    if mlb_limit is not None:
+    if enforce_mlb_limit and mlb_limit is not None:
         if requested_limit == 0:
             raise HTTPException(
                 status_code=403,
@@ -255,7 +259,6 @@ def validate_plan_access(account_id: int, requested_limit: int) -> dict:
         "usage_today": today_usage,
         "executions_remaining_today": max(daily_limit - executions_today, 0),
     }
-
 
 def register_daily_execution(account_id: int) -> dict:
     with db_connect() as conn:
@@ -1224,6 +1227,37 @@ def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) ->
     return out
 
 
+def get_latest_inventory_item_count(connected_seller_id: int) -> int | None:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT job_type, result_json
+                FROM app.async_job
+                WHERE connected_seller_id = %s
+                  AND status = 'finished'
+                  AND job_type IN ('inventory', 'full')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (connected_seller_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return None
+
+    result_json = row.get("result_json") or {}
+    if row.get("job_type") == "inventory":
+        stdout = ((result_json.get("inventory") or {}).get("stdout") or "")
+    else:
+        stdout = ((result_json.get("inventory") or {}).get("stdout") or "")
+
+    stats = parse_inventory_stats(stdout)
+    value = stats.get("item_ids_found")
+    return int(value) if value is not None else None
+
+
 def badge(status: str | None) -> str:
     status = (status or "").lower()
 
@@ -1510,7 +1544,7 @@ def run_inventory_async(request: Request, connected_seller_id: int = 1, limit: i
     user = require_user(request)
     seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
     account_id = int(seller_access["account_id"])
-    validate_plan_access(account_id, limit)
+    validate_plan_access(account_id, limit, enforce_mlb_limit=False)
     log_path = build_log_path("inventory_run")
     run_id = insert_job(
         job_type="inventory",
@@ -1530,7 +1564,7 @@ def run_rebate_async(request: Request, connected_seller_id: int = 1, limit: int 
     user = require_user(request)
     seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
     account_id = int(seller_access["account_id"])
-    validate_plan_access(account_id, limit)
+    validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("rebate_run")
     run_id = insert_job(
         job_type="rebate",
@@ -1550,7 +1584,7 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
     user = require_user(request)
     seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
     account_id = int(seller_access["account_id"])
-    validate_plan_access(account_id, limit)
+    validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("optimizer_run")
     csv_path = build_csv_path()
     run_id = insert_job(
@@ -1581,7 +1615,7 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
     user = require_user(request)
     seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
     account_id = int(seller_access["account_id"])
-    validate_plan_access(account_id, limit)
+    validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("full_pipeline")
     csv_path = build_csv_path()
     run_id = insert_job(
@@ -1742,9 +1776,11 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     executions_remaining_today = 0
     daily_execution_limit = None
     mlb_limit_label = "-"
-
     default_limit = 0
     limit_label = "Todos os anúncios"
+
+    inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
+    inventory_plan_warning = ""
 
     if subscription:
         subscription = expire_trial_if_needed(subscription)
@@ -1752,13 +1788,22 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             plan_name = subscription.get("plan_name") or subscription.get("plan_code") or "-"
             plan_status = subscription.get("status") or "inactive"
             if subscription.get("mlb_limit") is None:
-                mlb_limit_label = "Ilimitado"
                 default_limit = 0
+                mlb_limit_label = "Ilimitado"
                 limit_label = "Todos os anúncios"
             else:
-                mlb_limit_label = str(subscription.get("mlb_limit"))
                 default_limit = int(subscription.get("mlb_limit") or 0)
+                mlb_limit_label = str(default_limit)
                 limit_label = f"{default_limit} MLBs"
+
+                if inventory_item_count is not None and inventory_item_count > default_limit:
+                    excedente = inventory_item_count - default_limit
+                    inventory_plan_warning = (
+                        f"Sua conta tem {inventory_item_count} MLBs ativos mapeados no último inventory, "
+                        f"acima do limite do plano atual ({default_limit}). "
+                        f"Rebate, Optimizer e Otimização Completa serão limitados ao plano. "
+                        f"Excedente estimado: {excedente} MLBs."
+                    )
 
             daily_execution_limit = subscription.get("daily_execution_limit")
             usage_today = get_today_usage(current_account_id)
@@ -1928,13 +1973,12 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <div class="plan-card">
                         <div class="plan-label">Plano atual</div>
                         <div class="plan-name">{plan_name}</div>
-                        <div class="plan-meta">
-                            <span class="status-pill {plan_status}">{plan_status.upper()}</span>
-                        </div>
+                        <div class="plan-meta"><span class="status-pill {plan_status}">{plan_status.upper()}</span></div>
                         <div class="plan-meta">Limite por execução: {mlb_limit_label} MLBs</div>
                         <div class="plan-meta">Execuções hoje: {executions_today}{f' / {daily_execution_limit}' if daily_execution_limit is not None else ''}</div>
                         <div class="plan-meta">Execuções restantes hoje: {executions_remaining_today}</div>
                         {f'<div class="plan-meta" style="color:#86efac;">{plan_days_left} dias restantes no período atual</div>' if plan_days_left is not None and plan_status == 'trialing' else ''}
+                        {f'<div class="plan-meta" style="margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.28); color:#fde68a;">{inventory_plan_warning}</div>' if inventory_plan_warning else ''}
                     </div>
                     <div class="actions">
                         <a class="button-link" href="{new_connect_href}" onclick="return validarNovaConta();"><button class="btn btn-connect" type="button">Conectar nova conta Mercado Livre</button></a>
@@ -1956,7 +2000,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <div class="form-row">
                         <label>Escopo da execução</label>
                         <div class="scope-box">{limit_label}</div>
-                        <div class="scope-help">O escopo é definido automaticamente conforme o plano da conta.</div>
+                        <div class="scope-help">Rebate, Optimizer e Otimização Completa usam o escopo do plano. Inventory pode mapear toda a conta para sinalizar excedentes.</div>
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simulação (não altera campanhas)</label></div>
