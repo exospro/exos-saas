@@ -433,6 +433,40 @@ def require_account_role(user_account_id: int, account_id: int, allowed_roles: t
         raise HTTPException(status_code=403, detail="Você não tem permissão para gerenciar acessos desta conta.")
     return role
 
+def create_account_for_user(user_account_id: int, email: str, full_name: str | None = None) -> int:
+    email = (email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="E-mail inválido para criar conta.")
+
+    account_name = (full_name or "").strip()
+    if not account_name:
+        account_name = email.split("@")[0]
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO app.account (name, created_at, updated_at)
+                VALUES (%s, now(), now())
+                RETURNING id
+                """,
+                (account_name,),
+            )
+            account_id = int(cur.fetchone()["id"])
+
+            cur.execute(
+                """
+                INSERT INTO app.account_user (account_id, user_account_id, role, created_at)
+                VALUES (%s, %s, 'owner', now())
+                ON CONFLICT (account_id, user_account_id) DO NOTHING
+                """,
+                (account_id, user_account_id),
+            )
+
+        conn.commit()
+
+    return account_id
+
 
 def list_account_invites(account_id: int) -> list[dict]:
     with db_connect() as conn:
@@ -1466,136 +1500,82 @@ def start_oauth(
     return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
 
 
-@app.get("/ml/oauth/callback")
-async def oauth_callback(request: Request):
+@app.get("/auth/google/callback")
+def auth_google_callback(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+    state_cookie = request.cookies.get("google_oauth_state")
+    return_to = request.cookies.get("post_login_redirect") or "/painel"
 
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing code")
-    if not state or not state.startswith("seller:"):
-        raise HTTPException(status_code=400, detail="Invalid state")
-
-    connected_seller_id: int | None = None
-    account_id: int | None = None
-    is_new = False
-
-    parts = state.split(":")
-    if len(parts) == 3 and parts[1] == "new":
-        is_new = True
-        account_id = int(parts[2])
-    elif len(parts) == 2:
-        connected_seller_id = int(parts[1])
-    else:
-        raise HTTPException(status_code=400, detail="Invalid state format")
+    if not code or not state or not state_cookie or state != state_cookie:
+        return RedirectResponse(url="/login?error=" + quote("Falha na autenticação com Google."))
 
     token_resp = requests.post(
-        TOKEN_URL,
+        GOOGLE_TOKEN_URL,
         data={
-            "grant_type": "authorization_code",
-            "client_id": ML_CLIENT_ID,
-            "client_secret": ML_CLIENT_SECRET,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
             "code": code,
-            "redirect_uri": ML_REDIRECT_URI,
+            "grant_type": "authorization_code",
+            "redirect_uri": GOOGLE_REDIRECT_URI,
         },
         timeout=30,
     )
     if token_resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Token error: {token_resp.text}")
+        return RedirectResponse(url="/login?error=" + quote("Não foi possível concluir o login com Google."))
 
-    tokens = token_resp.json()
-    access_token = tokens["access_token"]
-    refresh_token = tokens["refresh_token"]
-    token_type = tokens.get("token_type", "Bearer")
-    scope = tokens.get("scope")
-    expires_at = utc_now() + timedelta(seconds=int(tokens["expires_in"]))
+    access_token = token_resp.json().get("access_token")
+    if not access_token:
+        return RedirectResponse(url="/login?error=" + quote("Google não retornou token de acesso."))
 
-    me_resp = requests.get(ME_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
-    if me_resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch user: {me_resp.text}")
+    profile_resp = requests.get(
+        GOOGLE_USERINFO_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if profile_resp.status_code != 200:
+        return RedirectResponse(url="/login?error=" + quote("Não foi possível ler o perfil do Google."))
 
-    me = me_resp.json()
-    ml_user_id = me["id"]
-    seller_nickname = me.get("nickname")
-    site_id = me.get("site_id")
+    profile = profile_resp.json()
+    user = upsert_user_account_from_google(profile)
 
-    with db_connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if is_new:
-                cur.execute("SELECT id, account_id FROM ml.connected_seller WHERE ml_user_id = %s", (ml_user_id,))
-                existing = cur.fetchone()
-                if existing:
-                    connected_seller_id = int(existing["id"])
-                    account_id = int(existing["account_id"])
-                    cur.execute(
-                        """
-                        UPDATE ml.connected_seller
-                           SET seller_nickname = %s,
-                               site_id = %s,
-                               status = 'active',
-                               authorized_at = now(),
-                               updated_at = now()
-                         WHERE id = %s
-                        """,
-                        (seller_nickname, site_id, connected_seller_id),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO ml.connected_seller (
-                            account_id, ml_user_id, seller_nickname, site_id, status, authorized_at, created_at, updated_at
-                        )
-                        VALUES (%s, %s, %s, %s, 'active', now(), now(), now())
-                        RETURNING id
-                        """,
-                        (account_id, ml_user_id, seller_nickname, site_id),
-                    )
-                    connected_seller_id = int(cur.fetchone()["id"])
-            else:
-                cur.execute(
-                    """
-                    UPDATE ml.connected_seller
-                       SET ml_user_id = %s,
-                           seller_nickname = %s,
-                           site_id = %s,
-                           status = 'active',
-                           authorized_at = now(),
-                           updated_at = now()
-                     WHERE id = %s
-                    RETURNING id, account_id
-                    """,
-                    (ml_user_id, seller_nickname, site_id, connected_seller_id),
-                )
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"connected_seller_id {connected_seller_id} não encontrado")
-                account_id = row["account_id"]
+    # tenta aceitar convites pendentes desse e-mail
+    auto_link_user_by_invite(int(user["id"]), user["email"])
 
-            cur.execute(
-                """
-                INSERT INTO ml.oauth_token (
-                    connected_seller_id, access_token, refresh_token, token_type, scope, expires_at, last_refresh_at, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, now(), now())
-                ON CONFLICT (connected_seller_id)
-                DO UPDATE SET
-                    access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
-                    token_type = EXCLUDED.token_type,
-                    scope = EXCLUDED.scope,
-                    expires_at = EXCLUDED.expires_at,
-                    last_refresh_at = now(),
-                    updated_at = now()
-                """,
-                (connected_seller_id, access_token, refresh_token, token_type, scope, expires_at),
-            )
-        conn.commit()
+    # verifica contas já vinculadas
+    account_ids = get_user_account_ids(int(user["id"]))
 
-    redirect_url = f"/painel?connected_seller_id={connected_seller_id}&connected=1"
-    if account_id:
-        redirect_url += f"&account_id={account_id}"
-    return RedirectResponse(url=redirect_url)
+    # se não tiver nenhuma conta, cria automaticamente
+    if not account_ids:
+        account_id = create_account_for_user(
+            user_account_id=int(user["id"]),
+            email=user["email"],
+            full_name=user.get("full_name"),
+        )
+    else:
+        account_id = int(account_ids[0])
 
+    # cria trial apenas se não existir assinatura válida
+    trial_created_now = ensure_trial_for_account(account_id)
+
+    session_token = create_web_session(int(user["id"]))
+
+    # se acabou de criar trial, manda para onboarding
+    # senão, segue fluxo normal
+    redirect_url = "/onboarding" if trial_created_now else return_to
+
+    response = RedirectResponse(url=redirect_url)
+    response.set_cookie(
+        APP_SESSION_COOKIE_NAME,
+        session_token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=APP_SESSION_DAYS * 24 * 60 * 60,
+    )
+    response.delete_cookie("google_oauth_state")
+    response.delete_cookie("post_login_redirect")
+    return response
 
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
