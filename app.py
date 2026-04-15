@@ -45,7 +45,6 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
 
 
-
 def ensure_trial_for_account(account_id: int) -> bool:
     """
     Retorna True se criou trial agora.
@@ -358,7 +357,6 @@ def register_daily_execution(account_id: int) -> dict:
     return dict(row)
 
 
-
 def get_session_user(request: Request) -> dict | None:
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
     if not token:
@@ -639,7 +637,6 @@ def upsert_user_account_from_google(profile: dict) -> dict:
     return dict(row)
 
 
-
 def auto_link_user_by_invite(user_account_id: int, email: str) -> list[int]:
     email = (email or "").strip().lower()
     if not email:
@@ -851,8 +848,6 @@ def auth_google_start(request: Request):
     response.set_cookie("google_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600)
     response.set_cookie("post_login_redirect", return_to, httponly=True, secure=True, samesite="lax", max_age=600)
     return response
-
-
 
 
 @app.post("/auth/logout")
@@ -1433,6 +1428,145 @@ def start_oauth(
         "state": state,
     }
     return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
+
+
+@app.get("/ml/oauth/callback")
+async def oauth_callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
+    if not state or not state.startswith("seller:"):
+        raise HTTPException(status_code=400, detail="Invalid state")
+
+    connected_seller_id: int | None = None
+    account_id: int | None = None
+    is_new = False
+
+    parts = state.split(":")
+    if len(parts) == 3 and parts[1] == "new":
+        is_new = True
+        account_id = int(parts[2])
+    elif len(parts) == 2:
+        connected_seller_id = int(parts[1])
+    else:
+        raise HTTPException(status_code=400, detail="Invalid state format")
+
+    token_resp = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": ML_CLIENT_ID,
+            "client_secret": ML_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": ML_REDIRECT_URI,
+        },
+        timeout=30,
+    )
+    if token_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Token error: {token_resp.text}")
+
+    tokens = token_resp.json()
+    access_token = tokens["access_token"]
+    refresh_token = tokens["refresh_token"]
+    token_type = tokens.get("token_type", "Bearer")
+    scope = tokens.get("scope")
+    expires_at = utc_now() + timedelta(seconds=int(tokens["expires_in"]))
+
+    me_resp = requests.get(
+        ME_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if me_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch user: {me_resp.text}")
+
+    me = me_resp.json()
+    ml_user_id = me["id"]
+    seller_nickname = me.get("nickname")
+    site_id = me.get("site_id")
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if is_new:
+                cur.execute(
+                    "SELECT id, account_id FROM ml.connected_seller WHERE ml_user_id = %s",
+                    (ml_user_id,),
+                )
+                existing = cur.fetchone()
+
+                if existing:
+                    connected_seller_id = int(existing["id"])
+                    account_id = int(existing["account_id"])
+                    cur.execute(
+                        """
+                        UPDATE ml.connected_seller
+                           SET seller_nickname = %s,
+                               site_id = %s,
+                               status = 'active',
+                               authorized_at = now(),
+                               updated_at = now()
+                         WHERE id = %s
+                        """,
+                        (seller_nickname, site_id, connected_seller_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO ml.connected_seller (
+                            account_id, ml_user_id, seller_nickname, site_id, status, authorized_at, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, 'active', now(), now(), now())
+                        RETURNING id
+                        """,
+                        (account_id, ml_user_id, seller_nickname, site_id),
+                    )
+                    connected_seller_id = int(cur.fetchone()["id"])
+            else:
+                cur.execute(
+                    """
+                    UPDATE ml.connected_seller
+                       SET ml_user_id = %s,
+                           seller_nickname = %s,
+                           site_id = %s,
+                           status = 'active',
+                           authorized_at = now(),
+                           updated_at = now()
+                     WHERE id = %s
+                    RETURNING id, account_id
+                    """,
+                    (ml_user_id, seller_nickname, site_id, connected_seller_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail=f"connected_seller_id {connected_seller_id} não encontrado")
+                account_id = int(row["account_id"])
+
+            cur.execute(
+                """
+                INSERT INTO ml.oauth_token (
+                    connected_seller_id, access_token, refresh_token, token_type, scope, expires_at, last_refresh_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (connected_seller_id)
+                DO UPDATE SET
+                    access_token = EXCLUDED.access_token,
+                    refresh_token = EXCLUDED.refresh_token,
+                    token_type = EXCLUDED.token_type,
+                    scope = EXCLUDED.scope,
+                    expires_at = EXCLUDED.expires_at,
+                    last_refresh_at = now(),
+                    updated_at = now()
+                """,
+                (connected_seller_id, access_token, refresh_token, token_type, scope, expires_at),
+            )
+        conn.commit()
+
+    redirect_url = f"/painel?connected_seller_id={connected_seller_id}&connected=1"
+    if account_id:
+        redirect_url += f"&account_id={account_id}"
+    return RedirectResponse(url=redirect_url)
 
 @app.get("/auth/google/callback")
 def auth_google_callback(request: Request):
