@@ -849,75 +849,6 @@ def auth_google_start(request: Request):
     return response
 
 
-@app.get("/auth/google/callback")
-def auth_google_callback(request: Request):
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    state_cookie = request.cookies.get("google_oauth_state")
-    return_to = request.cookies.get("post_login_redirect") or "/painel"
-
-    if not code or not state or not state_cookie or state != state_cookie:
-        return RedirectResponse(url="/login?error=" + quote("Falha na autenticação com Google."))
-
-    token_resp = requests.post(
-        GOOGLE_TOKEN_URL,
-        data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": GOOGLE_REDIRECT_URI,
-        },
-        timeout=30,
-    )
-    if token_resp.status_code != 200:
-        return RedirectResponse(url="/login?error=" + quote("Não foi possível concluir o login com Google."))
-
-    access_token = token_resp.json().get("access_token")
-    if not access_token:
-        return RedirectResponse(url="/login?error=" + quote("Google não retornou token de acesso."))
-
-    profile_resp = requests.get(
-        GOOGLE_USERINFO_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
-    if profile_resp.status_code != 200:
-        return RedirectResponse(url="/login?error=" + quote("Não foi possível ler o perfil do Google."))
-
-    user = upsert_user_account_from_google(profile_resp.json())
-
-    auto_link_user_by_invite(int(user["id"]), user["email"])
-
-    account_ids = get_user_account_ids(int(user["id"]))
-    if not account_ids:
-        return RedirectResponse(url="/login?error=" + quote("Seu e-mail ainda não foi liberado para acessar o sistema."))
-
-    # pega a primeira conta disponível do usuário
-    account_id = int(account_ids[0])
-
-    # cria trial apenas se não existir assinatura válida
-    trial_created_now = ensure_trial_for_account(account_id)
-
-    session_token = create_web_session(int(user["id"]))
-
-    # regra de redirecionamento:
-    # - se criou trial agora -> onboarding
-    # - se já tinha plano/trial -> painel
-    redirect_url = "/onboarding" if trial_created_now else return_to
-
-    response = RedirectResponse(url=redirect_url)
-    response.set_cookie(
-        APP_SESSION_COOKIE_NAME,
-        session_token,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        max_age=APP_SESSION_DAYS * 24 * 60 * 60,
-    )
-    response.delete_cookie("google_oauth_state")
-    response.delete_cookie("post_login_redirect")
-    return response
 
 
 @app.post("/auth/logout")
@@ -1499,7 +1430,6 @@ def start_oauth(
     }
     return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
 
-
 @app.get("/auth/google/callback")
 def auth_google_callback(request: Request):
     code = request.query_params.get("code")
@@ -1521,31 +1451,25 @@ def auth_google_callback(request: Request):
         },
         timeout=30,
     )
+
     if token_resp.status_code != 200:
         return RedirectResponse(url="/login?error=" + quote("Não foi possível concluir o login com Google."))
 
     access_token = token_resp.json().get("access_token")
-    if not access_token:
-        return RedirectResponse(url="/login?error=" + quote("Google não retornou token de acesso."))
 
     profile_resp = requests.get(
         GOOGLE_USERINFO_URL,
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=30,
     )
-    if profile_resp.status_code != 200:
-        return RedirectResponse(url="/login?error=" + quote("Não foi possível ler o perfil do Google."))
 
-    profile = profile_resp.json()
-    user = upsert_user_account_from_google(profile)
+    user = upsert_user_account_from_google(profile_resp.json())
 
-    # tenta aceitar convites pendentes desse e-mail
     auto_link_user_by_invite(int(user["id"]), user["email"])
 
-    # verifica contas já vinculadas
     account_ids = get_user_account_ids(int(user["id"]))
 
-    # se não tiver nenhuma conta, cria automaticamente
+    # 🔥 CORREÇÃO PRINCIPAL
     if not account_ids:
         account_id = create_account_for_user(
             user_account_id=int(user["id"]),
@@ -1555,13 +1479,10 @@ def auth_google_callback(request: Request):
     else:
         account_id = int(account_ids[0])
 
-    # cria trial apenas se não existir assinatura válida
     trial_created_now = ensure_trial_for_account(account_id)
 
     session_token = create_web_session(int(user["id"]))
 
-    # se acabou de criar trial, manda para onboarding
-    # senão, segue fluxo normal
     redirect_url = "/onboarding" if trial_created_now else return_to
 
     response = RedirectResponse(url=redirect_url)
@@ -1573,8 +1494,10 @@ def auth_google_callback(request: Request):
         samesite="lax",
         max_age=APP_SESSION_DAYS * 24 * 60 * 60,
     )
+
     response.delete_cookie("google_oauth_state")
     response.delete_cookie("post_login_redirect")
+
     return response
 
 @app.get("/run/inventory")
