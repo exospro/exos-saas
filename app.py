@@ -750,6 +750,10 @@ def render_login_page(error_message: str = "") -> str:
 @app.get("/onboarding", response_class=HTMLResponse)
 def onboarding_page(request: Request):
     user = require_user(request)
+    account_ids = get_user_account_ids(int(user["id"]))
+    account_id = int(account_ids[0]) if account_ids else None
+    connect_href = f"/ml/oauth/start?account_id={account_id}" if account_id else "/painel"
+
     return f"""
     <!DOCTYPE html>
     <html lang="pt-br">
@@ -771,7 +775,7 @@ def onboarding_page(request: Request):
         }}
         .box {{
           width: 100%;
-          max-width: 720px;
+          max-width: 760px;
           text-align: center;
           background: rgba(255,255,255,.04);
           border: 1px solid rgba(255,255,255,.08);
@@ -816,8 +820,8 @@ def onboarding_page(request: Request):
       <div class="box">
         <h1>🎉 Seu teste grátis <span class="gradient">começou</span></h1>
         <p>Você tem <b>10 dias</b> para testar o EXOS Profit e descobrir oportunidades reais de lucro no Mercado Livre.</p>
-        <p>Próximo passo: entrar no painel e conectar sua conta para começar a análise.</p>
-        <a class="btn" href="/painel">Ir para o painel</a>
+        <p>Próximo passo: <b>conectar sua conta do Mercado Livre</b> para começar a análise.</p>
+        <a class="btn" href="{connect_href}">Conectar conta do Mercado Livre</a>
         <div class="micro">Logado como: {user.get('email')}</div>
       </div>
     </body>
@@ -1917,7 +1921,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
     connected_banner = '<div class="flash success">Conta conectada com sucesso.</div>' if connected == 1 else ''
     #new_connect_href = f"/ml/oauth/start?account_id={account_id}" if account_id else "#"
-    new_connect_href = f"/login" 
+    new_connect_href = f"/ml/oauth/start?account_id={current_account_id}"
     reconnect_href = f"/ml/oauth/start?connected_seller_id={connected_seller_id}"
 
     return f"""
