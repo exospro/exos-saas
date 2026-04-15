@@ -45,6 +45,76 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
 
 
+
+def ensure_trial_for_account(account_id: int) -> bool:
+    """
+    Retorna True se criou trial agora.
+    Retorna False se já existia assinatura válida.
+    """
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM billing.subscription
+                WHERE account_id = %s
+                  AND status IN ('trialing', 'active', 'past_due', 'paused')
+                LIMIT 1
+                """,
+                (account_id,),
+            )
+            if cur.fetchone():
+                conn.commit()
+                return False
+
+            cur.execute(
+                """
+                SELECT id, trial_days
+                FROM billing.plan
+                WHERE code = 'trial'
+                  AND is_active = TRUE
+                LIMIT 1
+                """
+            )
+            plan = cur.fetchone()
+            if not plan:
+                conn.commit()
+                return False
+
+            plan_id, trial_days = plan
+
+            cur.execute(
+                """
+                INSERT INTO billing.subscription (
+                    account_id,
+                    plan_id,
+                    provider,
+                    status,
+                    current_period_start,
+                    current_period_end,
+                    cancel_at_period_end,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'internal',
+                    'trialing',
+                    now(),
+                    now() + (%s || ' days')::interval,
+                    FALSE,
+                    now(),
+                    now()
+                )
+                """,
+                (account_id, plan_id, int(trial_days or 10)),
+            )
+
+        conn.commit()
+
+    return True
+
 def get_live_subscription(account_id: int) -> dict | None:
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -643,6 +713,83 @@ def render_login_page(error_message: str = "") -> str:
     </html>
     """
 
+@app.get("/onboarding", response_class=HTMLResponse)
+def onboarding_page(request: Request):
+    user = require_user(request)
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt-br">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Bem-vindo ao EXOS Profit</title>
+      <style>
+        body {{
+          margin: 0;
+          font-family: Inter, Arial, sans-serif;
+          background: #020617;
+          color: #e2e8f0;
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+        }}
+        .box {{
+          width: 100%;
+          max-width: 720px;
+          text-align: center;
+          background: rgba(255,255,255,.04);
+          border: 1px solid rgba(255,255,255,.08);
+          border-radius: 24px;
+          padding: 40px 32px;
+          box-shadow: 0 24px 60px rgba(0,0,0,.35);
+        }}
+        h1 {{
+          margin: 0 0 14px;
+          font-size: 42px;
+          line-height: 1.05;
+        }}
+        .gradient {{
+          background: linear-gradient(90deg,#2FD4C7,#38bdf8);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+        }}
+        p {{
+          color: #94a3b8;
+          font-size: 18px;
+          line-height: 1.6;
+          margin: 12px 0;
+        }}
+        .btn {{
+          display: inline-block;
+          margin-top: 24px;
+          background: linear-gradient(135deg,#2FD4C7,#1CB3A6);
+          color: #022c22;
+          padding: 16px 28px;
+          border-radius: 12px;
+          text-decoration: none;
+          font-weight: 800;
+        }}
+        .micro {{
+          margin-top: 12px;
+          font-size: 14px;
+          color: #64748b;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="box">
+        <h1>🎉 Seu teste grátis <span class="gradient">começou</span></h1>
+        <p>Você tem <b>10 dias</b> para testar o EXOS Profit e descobrir oportunidades reais de lucro no Mercado Livre.</p>
+        <p>Próximo passo: entrar no painel e conectar sua conta para começar a análise.</p>
+        <a class="btn" href="/painel">Ir para o painel</a>
+        <div class="micro">Logado como: {user.get('email')}</div>
+      </div>
+    </body>
+    </html>
+    """
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: str | None = None):
     return render_login_page(error or "")
@@ -706,16 +853,26 @@ def auth_google_callback(request: Request):
 
     user = upsert_user_account_from_google(profile_resp.json())
 
-    # vincula automaticamente por convite/liberação prévia
     auto_link_user_by_invite(int(user["id"]), user["email"])
 
-    # acesso apenas para usuários vinculados a alguma conta
     account_ids = get_user_account_ids(int(user["id"]))
     if not account_ids:
         return RedirectResponse(url="/login?error=" + quote("Seu e-mail ainda não foi liberado para acessar o sistema."))
 
+    # pega a primeira conta disponível do usuário
+    account_id = int(account_ids[0])
+
+    # cria trial apenas se não existir assinatura válida
+    trial_created_now = ensure_trial_for_account(account_id)
+
     session_token = create_web_session(int(user["id"]))
-    response = RedirectResponse(url=return_to)
+
+    # regra de redirecionamento:
+    # - se criou trial agora -> onboarding
+    # - se já tinha plano/trial -> painel
+    redirect_url = "/onboarding" if trial_created_now else return_to
+
+    response = RedirectResponse(url=redirect_url)
     response.set_cookie(
         APP_SESSION_COOKIE_NAME,
         session_token,
@@ -1833,6 +1990,28 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
         </div>
         """
 
+    
+    trial_banner = ""
+    expired_banner = ""
+
+    if plan_status == "trialing" and plan_days_left is not None:
+        trial_banner = f'''
+        <div style="margin-bottom:16px;padding:14px 18px;border-radius:14px;
+        background:rgba(47,212,199,.15);border:1px solid rgba(47,212,199,.35);
+        color:#d8f4f1;font-weight:700;text-align:center;">
+        🎉 Seu teste grátis está ativo • {plan_days_left} dias restantes
+        </div>
+        '''
+
+    if plan_status == "expired":
+        expired_banner = '''
+        <div style="margin-bottom:16px;padding:14px;border-radius:12px;
+        background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.4);
+        color:#fecaca;text-align:center;font-weight:700;">
+        🚫 Seu teste expirou • Assine um plano para continuar
+        </div>
+        '''
+
     connected_banner = '<div class="flash success">Conta conectada com sucesso.</div>' if connected == 1 else ''
     #new_connect_href = f"/ml/oauth/start?account_id={account_id}" if account_id else "#"
     new_connect_href = f"/login" 
@@ -1965,7 +2144,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 <div class="muted" style="margin-top:10px;">Usuário: {user.get('full_name') or user.get('email')}</div>
                 <div style="margin-top:10px;"><button class="btn btn-secondary" style="width:auto; padding:10px 14px; font-size:14px;" onclick="logout()">Sair</button></div>
             </div>
-            {connected_banner}
+            {connected_banner}{trial_banner}{expired_banner}
             <div class="grid">
                 <div class="card">
                     <h2>Conta Mercado Livre</h2>
