@@ -45,6 +45,7 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
 
 
+
 def ensure_trial_for_account(account_id: int) -> bool:
     """
     Retorna True se criou trial agora.
@@ -357,6 +358,7 @@ def register_daily_execution(account_id: int) -> dict:
     return dict(row)
 
 
+
 def get_session_user(request: Request) -> dict | None:
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
     if not token:
@@ -637,6 +639,7 @@ def upsert_user_account_from_google(profile: dict) -> dict:
     return dict(row)
 
 
+
 def auto_link_user_by_invite(user_account_id: int, email: str) -> list[int]:
     email = (email or "").strip().lower()
     if not email:
@@ -848,6 +851,8 @@ def auth_google_start(request: Request):
     response.set_cookie("google_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600)
     response.set_cookie("post_login_redirect", return_to, httponly=True, secure=True, samesite="lax", max_age=600)
     return response
+
+
 
 
 @app.post("/auth/logout")
@@ -1430,8 +1435,12 @@ def start_oauth(
     return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
 
 
+
 @app.get("/ml/oauth/callback")
 async def oauth_callback(request: Request):
+    current_user = require_user(request)
+    current_user_id = int(current_user["id"])
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
 
@@ -1499,6 +1508,16 @@ async def oauth_callback(request: Request):
                 if existing:
                     connected_seller_id = int(existing["id"])
                     account_id = int(existing["account_id"])
+
+                    cur.execute(
+                        """
+                        INSERT INTO app.account_user (account_id, user_account_id, role, created_at)
+                        VALUES (%s, %s, 'owner', now())
+                        ON CONFLICT (account_id, user_account_id) DO NOTHING
+                        """,
+                        (account_id, current_user_id),
+                    )
+
                     cur.execute(
                         """
                         UPDATE ml.connected_seller
@@ -1523,6 +1542,15 @@ async def oauth_callback(request: Request):
                         (account_id, ml_user_id, seller_nickname, site_id),
                     )
                     connected_seller_id = int(cur.fetchone()["id"])
+
+                    cur.execute(
+                        """
+                        INSERT INTO app.account_user (account_id, user_account_id, role, created_at)
+                        VALUES (%s, %s, 'owner', now())
+                        ON CONFLICT (account_id, user_account_id) DO NOTHING
+                        """,
+                        (account_id, current_user_id),
+                    )
             else:
                 cur.execute(
                     """
@@ -1542,6 +1570,15 @@ async def oauth_callback(request: Request):
                 if not row:
                     raise HTTPException(status_code=404, detail=f"connected_seller_id {connected_seller_id} não encontrado")
                 account_id = int(row["account_id"])
+
+                cur.execute(
+                    """
+                    INSERT INTO app.account_user (account_id, user_account_id, role, created_at)
+                    VALUES (%s, %s, 'owner', now())
+                    ON CONFLICT (account_id, user_account_id) DO NOTHING
+                    """,
+                    (account_id, current_user_id),
+                )
 
             cur.execute(
                 """
