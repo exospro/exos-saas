@@ -220,21 +220,12 @@ def fetch_item_detail(
 
 
 def extract_sku_from_item(item: dict) -> str | None:
-    # 1) seller_custom_field
-    scf = item.get("seller_custom_field")
+    scf = extract_sku_from_item(item)
     if scf:
         return scf
-
-    # 2) attributes SELLER_SKU at item level
     for attr in item.get("attributes", []) or []:
         if (attr.get("id") or "").upper() == "SELLER_SKU":
             return attr.get("value_name") or attr.get("value_id")
-
-    # 3) fallback opcional: MODEL
-    for attr in item.get("attributes", []) or []:
-        if (attr.get("id") or "").upper() == "MODEL":
-            return attr.get("value_name") or attr.get("value_id")
-
     return None
 
 def build_rows(
@@ -263,15 +254,25 @@ def build_rows(
             for var in variations:
                 variation_id = var.get("id")
                 stock = var.get("available_quantity")
-                seller_sku = None
+                # 1. SKU direto da variação (principal)
+                seller_sku = var.get("seller_custom_field")
+
+                # 2. fallback via attributes da variação
+                if not seller_sku:
+                    for attr in var.get("attributes", []) or []:
+                        if (attr.get("id") or "").upper() == "SELLER_SKU":
+                            seller_sku = attr.get("value_name") or attr.get("value_id")
+                            break
+
+                # 3. fallback item-level
+                if not seller_sku:
+                    seller_sku = extract_sku_from_item(item)
+
 
                 for attr in var.get("attributes", []) or []:
                     if (attr.get("id") or "").upper() == "SELLER_SKU":
                         seller_sku = attr.get("value_name") or attr.get("value_id")
                         break
-
-                if not seller_sku:
-                    seller_sku = extract_sku_from_item(item)
 
                 rows.append(
                     (
