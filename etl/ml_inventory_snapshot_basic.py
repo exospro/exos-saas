@@ -217,6 +217,26 @@ def fetch_item_detail(
 
 
 
+
+
+def extract_sku_from_item(item: dict) -> str | None:
+    # 1) seller_custom_field
+    scf = item.get("seller_custom_field")
+    if scf:
+        return scf
+
+    # 2) attributes SELLER_SKU at item level
+    for attr in item.get("attributes", []) or []:
+        if (attr.get("id") or "").upper() == "SELLER_SKU":
+            return attr.get("value_name") or attr.get("value_id")
+
+    # 3) fallback opcional: MODEL
+    for attr in item.get("attributes", []) or []:
+        if (attr.get("id") or "").upper() == "MODEL":
+            return attr.get("value_name") or attr.get("value_id")
+
+    return None
+
 def build_rows(
     *,
     connected_seller_id: int,
@@ -250,6 +270,9 @@ def build_rows(
                         seller_sku = attr.get("value_name") or attr.get("value_id")
                         break
 
+                if not seller_sku:
+                    seller_sku = extract_sku_from_item(item)
+
                 rows.append(
                     (
                         connected_seller_id,
@@ -275,7 +298,7 @@ def build_rows(
                     mlb,
                     status,
                     None,
-                    item.get("seller_custom_field"),
+                    extract_sku_from_item(item),
                     item.get("available_quantity"),
                     price,
                     base_price,
