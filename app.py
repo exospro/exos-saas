@@ -42,6 +42,250 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
+LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
+
+
+def get_live_subscription(account_id: int) -> dict | None:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.id,
+                    s.account_id,
+                    s.plan_id,
+                    s.provider,
+                    s.provider_customer_id,
+                    s.provider_subscription_id,
+                    s.status,
+                    s.current_period_start,
+                    s.current_period_end,
+                    s.cancel_at_period_end,
+                    p.code AS plan_code,
+                    p.name AS plan_name,
+                    p.price_monthly,
+                    p.mlb_limit,
+                    p.daily_execution_limit,
+                    p.trial_days
+                FROM billing.subscription s
+                JOIN billing.plan p
+                  ON p.id = s.plan_id
+                WHERE s.account_id = %s
+                  AND s.status IN ('trialing', 'active', 'past_due', 'paused')
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                (account_id,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def expire_trial_if_needed(subscription: dict | None) -> dict | None:
+    if not subscription or subscription.get("status") != "trialing":
+        return subscription
+
+    period_end = subscription.get("current_period_end")
+    if not period_end:
+        return subscription
+
+    now = datetime.now(timezone.utc)
+    if period_end <= now:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE billing.subscription
+                    SET status = 'expired',
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (subscription["id"],),
+                )
+            conn.commit()
+        subscription["status"] = "expired"
+    return subscription
+
+
+def create_trial_subscription_if_missing(account_id: int) -> dict | None:
+    current = get_live_subscription(account_id)
+    if current:
+        return current
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, code, name, trial_days
+                FROM billing.plan
+                WHERE code = 'trial'
+                  AND is_active = TRUE
+                LIMIT 1
+                """
+            )
+            trial_plan = cur.fetchone()
+
+            if not trial_plan:
+                conn.commit()
+                return None
+
+            cur.execute(
+                """
+                INSERT INTO billing.subscription (
+                    account_id,
+                    plan_id,
+                    provider,
+                    status,
+                    current_period_start,
+                    current_period_end,
+                    cancel_at_period_end,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'internal',
+                    'trialing',
+                    now(),
+                    now() + (%s || ' days')::interval,
+                    FALSE,
+                    now(),
+                    now()
+                )
+                RETURNING id
+                """,
+                (account_id, trial_plan["id"], int(trial_plan["trial_days"] or 10)),
+            )
+            cur.fetchone()
+        conn.commit()
+
+    return get_live_subscription(account_id)
+
+
+def get_or_create_subscription(account_id: int) -> dict | None:
+    subscription = get_live_subscription(account_id)
+    if subscription:
+        subscription = expire_trial_if_needed(subscription)
+        if subscription and subscription.get("status") == "expired":
+            return None
+        return subscription
+
+    created = create_trial_subscription_if_missing(account_id)
+    if not created:
+        return None
+
+    created = expire_trial_if_needed(created)
+    if created and created.get("status") == "expired":
+        return None
+    return created
+
+
+def get_today_usage(account_id: int) -> dict:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT account_id, usage_date, executions_count, last_execution_at
+                FROM billing.usage_daily
+                WHERE account_id = %s
+                  AND usage_date = CURRENT_DATE
+                """,
+                (account_id,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else {
+        "account_id": account_id,
+        "usage_date": None,
+        "executions_count": 0,
+        "last_execution_at": None,
+    }
+
+
+def validate_plan_access(account_id: int, requested_limit: int) -> dict:
+    """
+    Bloqueia qualquer passo caso:
+      - não exista assinatura ativa/trial
+      - trial tenha expirado
+      - status esteja fora dos statuses vivos
+      - limite diário de execuções já tenha sido atingido
+      - requested_limit ultrapasse o limite do plano
+      - requested_limit == 0 em plano com mlb_limit definido
+    """
+    subscription = get_or_create_subscription(account_id)
+    if not subscription:
+        raise HTTPException(
+            status_code=403,
+            detail="Sua conta não possui assinatura ativa. Escolha um plano para continuar.",
+        )
+
+    subscription = expire_trial_if_needed(subscription)
+    if subscription and subscription.get("status") == "expired":
+        raise HTTPException(
+            status_code=403,
+            detail="Seu período de teste expirou. Escolha um plano para continuar.",
+        )
+
+    plan_code = subscription["plan_code"]
+    mlb_limit = subscription["mlb_limit"]
+    daily_limit = int(subscription["daily_execution_limit"] or 0)
+
+    if mlb_limit is not None:
+        if requested_limit == 0:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Seu plano {plan_code} não permite executar em todos os anúncios. Limite máximo: {mlb_limit} MLBs por execução.",
+            )
+        if requested_limit > int(mlb_limit):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Seu plano {plan_code} permite no máximo {mlb_limit} MLBs por execução.",
+            )
+
+    today_usage = get_today_usage(account_id)
+    executions_today = int(today_usage.get("executions_count") or 0)
+    if executions_today >= daily_limit:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Seu plano {plan_code} permite {daily_limit} execução(ões) por dia. Limite de hoje já foi atingido.",
+        )
+
+    return {
+        "subscription": subscription,
+        "usage_today": today_usage,
+        "executions_remaining_today": max(daily_limit - executions_today, 0),
+    }
+
+
+def register_daily_execution(account_id: int) -> dict:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO billing.usage_daily (
+                    account_id,
+                    usage_date,
+                    executions_count,
+                    last_execution_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, CURRENT_DATE, 1, now(), now(), now())
+                ON CONFLICT (account_id, usage_date)
+                DO UPDATE SET
+                    executions_count = billing.usage_daily.executions_count + 1,
+                    last_execution_at = now(),
+                    updated_at = now()
+                RETURNING account_id, usage_date, executions_count, last_execution_at
+                """,
+                (account_id,),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return dict(row)
+
+
+
 def get_session_user(request: Request) -> dict | None:
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
     if not token:
@@ -1264,7 +1508,9 @@ def async_ok_response(message: str, run_id: str, connected_seller_id: int, limit
 @app.get("/run/inventory_async")
 def run_inventory_async(request: Request, connected_seller_id: int = 1, limit: int = 0):
     user = require_user(request)
-    require_connected_seller_access(int(user["id"]), connected_seller_id)
+    seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
+    account_id = int(seller_access["account_id"])
+    validate_plan_access(account_id, limit)
     log_path = build_log_path("inventory_run")
     run_id = insert_job(
         job_type="inventory",
@@ -1282,7 +1528,9 @@ def run_inventory_async(request: Request, connected_seller_id: int = 1, limit: i
 @app.get("/run/rebate_async")
 def run_rebate_async(request: Request, connected_seller_id: int = 1, limit: int = 0):
     user = require_user(request)
-    require_connected_seller_access(int(user["id"]), connected_seller_id)
+    seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
+    account_id = int(seller_access["account_id"])
+    validate_plan_access(account_id, limit)
     log_path = build_log_path("rebate_run")
     run_id = insert_job(
         job_type="rebate",
@@ -1300,7 +1548,9 @@ def run_rebate_async(request: Request, connected_seller_id: int = 1, limit: int 
 @app.get("/run/optimizer_async")
 def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
     user = require_user(request)
-    require_connected_seller_access(int(user["id"]), connected_seller_id)
+    seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
+    account_id = int(seller_access["account_id"])
+    validate_plan_access(account_id, limit)
     log_path = build_log_path("optimizer_run")
     csv_path = build_csv_path()
     run_id = insert_job(
@@ -1313,6 +1563,7 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         log_file=log_path.name,
         csv_file=csv_path.name,
     )
+    register_daily_execution(account_id)
     return async_ok_response(
         "optimizer enfileirado",
         run_id,
@@ -1328,7 +1579,9 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
 @app.get("/run/full_async")
 def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
     user = require_user(request)
-    require_connected_seller_access(int(user["id"]), connected_seller_id)
+    seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
+    account_id = int(seller_access["account_id"])
+    validate_plan_access(account_id, limit)
     log_path = build_log_path("full_pipeline")
     csv_path = build_csv_path()
     run_id = insert_job(
@@ -1345,6 +1598,7 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
         log_file=log_path.name,
         csv_file=csv_path.name,
     )
+    register_daily_execution(account_id)
     return async_ok_response(
         "pipeline completo enfileirado",
         run_id,
