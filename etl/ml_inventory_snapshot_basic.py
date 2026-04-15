@@ -69,6 +69,7 @@ def fetch_item_ids_offset(
     session: requests.Session,
     *,
     connected_seller_id: int,
+    headers: dict[str, str],
     user_id: int,
     limit: int = 50,
     max_items: int | None = None,
@@ -82,7 +83,7 @@ def fetch_item_ids_offset(
         params = {"limit": page_size, "offset": offset}
         resp = session.get(
             url,
-            headers=get_headers(connected_seller_id),
+            headers=headers,
             params=params,
             timeout=DEFAULT_TIMEOUT,
         )
@@ -118,6 +119,7 @@ def fetch_item_ids_scan(
     session: requests.Session,
     *,
     connected_seller_id: int,
+    headers: dict[str, str],
     user_id: int,
     limit: int = 100,
     max_items: int | None = None,
@@ -137,7 +139,7 @@ def fetch_item_ids_scan(
 
         resp = session.get(
             url,
-            headers=get_headers(connected_seller_id),
+            headers=headers,
             params=params,
             timeout=DEFAULT_TIMEOUT,
         )
@@ -171,6 +173,7 @@ def fetch_item_ids(
     session: requests.Session,
     *,
     connected_seller_id: int,
+    headers: dict[str, str],
     user_id: int,
     limit: int = 50,
     max_items: int | None = None,
@@ -184,6 +187,7 @@ def fetch_item_ids(
         return fetch_item_ids_scan(
             session,
             connected_seller_id=connected_seller_id,
+            headers=headers,
             user_id=user_id,
             limit=limit,
             max_items=max_items,
@@ -193,6 +197,7 @@ def fetch_item_ids(
         return fetch_item_ids_offset(
             session,
             connected_seller_id=connected_seller_id,
+            headers=headers,
             user_id=user_id,
             limit=limit,
             max_items=max_items,
@@ -204,12 +209,13 @@ def fetch_item_detail(
     session: requests.Session,
     *,
     connected_seller_id: int,
+    headers: dict[str, str],
     item_id: str,
 ) -> dict[str, Any]:
     url = ITEM_URL.format(item_id=item_id)
     resp = session.get(
         url,
-        headers=get_headers(connected_seller_id),
+        headers=headers,
         timeout=DEFAULT_TIMEOUT,
     )
     resp.raise_for_status()
@@ -401,35 +407,44 @@ def main() -> None:
 
         try:
             print(f"[INVENTORY] Iniciando snapshot | connected_seller_id={connected_seller_id} | user_id={user_id}")
+            headers = get_headers(connected_seller_id)
+
             item_ids = fetch_item_ids(
                 session,
                 connected_seller_id=connected_seller_id,
+                headers=headers,
                 user_id=user_id,
                 limit=args.page_size,
                 max_items=args.limit_items,
             )
             print(f"[INVENTORY] IDs encontrados: {len(item_ids)}")
 
-            items: list[dict[str, Any]] = []
             total_ids = len(item_ids)
+            inserted = 0
+            batch_items: list[dict[str, Any]] = []
+            batch_size = 50
+
             for idx, item_id in enumerate(item_ids, start=1):
-                items.append(
+                batch_items.append(
                     fetch_item_detail(
                         session,
                         connected_seller_id=connected_seller_id,
+                        headers=headers,
                         item_id=item_id,
                     )
                 )
-                if should_log_progress(idx, total_ids, step=25):
+                if should_log_progress(idx, total_ids, step=10):
                     print(f"[INVENTORY] detalhe {idx}/{total_ids} | mlb={item_id}")
 
-            print(f"[INVENTORY] Montando linhas para insert | items={len(items)}")
-            rows = build_rows(
-                connected_seller_id=connected_seller_id,
-                run_id=run_id,
-                items=items,
-            )
-            inserted = insert_rows(conn, rows)
+                if len(batch_items) >= batch_size or idx == total_ids:
+                    rows = build_rows(
+                        connected_seller_id=connected_seller_id,
+                        run_id=run_id,
+                        items=batch_items,
+                    )
+                    inserted += insert_rows(conn, rows)
+                    print(f"[INVENTORY] batch gravado | batch_items={len(batch_items)} | rows_inserted_total={inserted}")
+                    batch_items = []
 
             finish_run(
                 conn,
