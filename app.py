@@ -1743,6 +1743,9 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     daily_execution_limit = None
     mlb_limit_label = "-"
 
+    default_limit = 0
+    limit_label = "Todos os anúncios"
+
     if subscription:
         subscription = expire_trial_if_needed(subscription)
         if subscription and subscription.get("status") != "expired":
@@ -1750,8 +1753,12 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             plan_status = subscription.get("status") or "inactive"
             if subscription.get("mlb_limit") is None:
                 mlb_limit_label = "Ilimitado"
+                default_limit = 0
+                limit_label = "Todos os anúncios"
             else:
                 mlb_limit_label = str(subscription.get("mlb_limit"))
+                default_limit = int(subscription.get("mlb_limit") or 0)
+                limit_label = f"{default_limit} MLBs"
 
             daily_execution_limit = subscription.get("daily_execution_limit")
             usage_today = get_today_usage(current_account_id)
@@ -1854,6 +1861,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .status-pill.past_due {{ background: rgba(245,158,11,.18); color: #fde68a; border: 1px solid rgba(245,158,11,.35); }}
             .status-pill.paused {{ background: rgba(148,163,184,.18); color: #e2e8f0; border: 1px solid rgba(148,163,184,.35); }}
             .status-pill.inactive, .status-pill.expired, .status-pill.canceled {{ background: rgba(239,68,68,.18); color: #fecaca; border: 1px solid rgba(239,68,68,.35); }}
+            .scope-box {{ margin-top: 6px; padding: 12px 14px; border-radius: 12px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.06); color:#ffffff; font-weight:700; }}
+            .scope-help {{ font-size: 12px; color: #9fb0d9; margin-top: 6px; }}
             #customLimitRow {{ display: none; }}
             a.button-link {{ text-decoration: none; display: block; }}
             .invite-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-top:12px; }}
@@ -1944,8 +1953,12 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
                     </div>
-                    <div class="form-row"><label for="limitMode">Escopo</label><select id="limitMode" onchange="toggleLimitInput()"><option value="50">50 anúncios</option><option value="100">100 anúncios</option><option value="custom">Quantidade personalizada</option><option value="all">Todos os anúncios</option></select></div>
-                    <div class="form-row" id="customLimitRow"><label for="limit">Quantidade personalizada</label><input type="number" id="limit" value="50" /></div>
+                    <div class="form-row">
+                        <label>Escopo da execução</label>
+                        <div class="scope-box">{limit_label}</div>
+                        <div class="scope-help">O escopo é definido automaticamente conforme o plano da conta.</div>
+                        <input type="hidden" id="limit" value="{default_limit}" />
+                    </div>
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simulação (não altera campanhas)</label></div>
                     <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>
                     <div class="warn-box" id="activeJobWarn"></div>
@@ -2016,16 +2029,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 return true;
             }}
 
-            function toggleLimitInput() {{
-                const mode = document.getElementById("limitMode").value;
-                document.getElementById("customLimitRow").style.display = mode === "custom" ? "block" : "none";
-            }}
+            function toggleLimitInput() {{}}
 
             function getLimitValue() {{
-                const mode = document.getElementById("limitMode").value;
-                if (mode === "all") return 0;
-                if (mode === "custom") return document.getElementById("limit").value || 0;
-                return mode;
+                return document.getElementById("limit").value || 0;
             }}
 
             function getParams() {{
