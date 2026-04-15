@@ -1818,7 +1818,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     user = require_user(request)
     accessible_sellers = get_accessible_connected_sellers(int(user["id"]))
     if not accessible_sellers:
-        return HTMLResponse("<h1>Acesso não liberado</h1><p>Seu e-mail ainda não está vinculado a nenhuma conta.</p>", status_code=403)
+        return RedirectResponse(url="/onboarding")
     if connected_seller_id is None:
         connected_seller_id = int(accessible_sellers[0]["connected_seller_id"])
     else:
