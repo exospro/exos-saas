@@ -1734,6 +1734,36 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
     can_manage_access = current_user_role in ("owner", "admin")
 
+    subscription = get_or_create_subscription(current_account_id)
+    plan_name = "-"
+    plan_status = "inactive"
+    plan_days_left = None
+    executions_today = 0
+    executions_remaining_today = 0
+    daily_execution_limit = None
+    mlb_limit_label = "-"
+
+    if subscription:
+        subscription = expire_trial_if_needed(subscription)
+        if subscription and subscription.get("status") != "expired":
+            plan_name = subscription.get("plan_name") or subscription.get("plan_code") or "-"
+            plan_status = subscription.get("status") or "inactive"
+            if subscription.get("mlb_limit") is None:
+                mlb_limit_label = "Ilimitado"
+            else:
+                mlb_limit_label = str(subscription.get("mlb_limit"))
+
+            daily_execution_limit = subscription.get("daily_execution_limit")
+            usage_today = get_today_usage(current_account_id)
+            executions_today = int(usage_today.get("executions_count") or 0)
+            if daily_execution_limit is not None:
+                executions_remaining_today = max(int(daily_execution_limit) - executions_today, 0)
+
+            if subscription.get("current_period_end"):
+                now_utc = datetime.now(timezone.utc)
+                delta = subscription["current_period_end"] - now_utc
+                plan_days_left = max(delta.days, 0)
+
     if seller["connected"]:
         status_html = f"""
         <div class="status-card connected">
@@ -1814,6 +1844,16 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .metric-label {{ font-size: 12px; color: #9fb0d9; margin-bottom: 4px; }}
             .metric-value {{ font-size: 22px; font-weight: 800; }}
             .warn-box {{ display:none; margin-top: 10px; padding: 12px 14px; border-radius: 12px; background: rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.28); color:#fde68a; }}
+            .plan-card {{ background: rgba(2,8,23,0.58); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 16px; margin: 14px 0 0; }}
+            .plan-label {{ font-size: 12px; color: #9fb0d9; margin-bottom: 6px; }}
+            .plan-name {{ font-size: 22px; font-weight: 800; margin-bottom: 8px; }}
+            .plan-meta {{ font-size: 13px; color: #d8e3ff; margin-top: 4px; }}
+            .status-pill {{ display:inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
+            .status-pill.trialing {{ background: rgba(59,130,246,.18); color: #bfdbfe; border: 1px solid rgba(59,130,246,.35); }}
+            .status-pill.active {{ background: rgba(34,197,94,.18); color: #bbf7d0; border: 1px solid rgba(34,197,94,.35); }}
+            .status-pill.past_due {{ background: rgba(245,158,11,.18); color: #fde68a; border: 1px solid rgba(245,158,11,.35); }}
+            .status-pill.paused {{ background: rgba(148,163,184,.18); color: #e2e8f0; border: 1px solid rgba(148,163,184,.35); }}
+            .status-pill.inactive, .status-pill.expired, .status-pill.canceled {{ background: rgba(239,68,68,.18); color: #fecaca; border: 1px solid rgba(239,68,68,.35); }}
             #customLimitRow {{ display: none; }}
             a.button-link {{ text-decoration: none; display: block; }}
             .invite-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-top:12px; }}
@@ -1876,6 +1916,17 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 <div class="card">
                     <h2>Conta Mercado Livre</h2>
                     {status_html}
+                    <div class="plan-card">
+                        <div class="plan-label">Plano atual</div>
+                        <div class="plan-name">{plan_name}</div>
+                        <div class="plan-meta">
+                            <span class="status-pill {plan_status}">{plan_status.upper()}</span>
+                        </div>
+                        <div class="plan-meta">Limite por execução: {mlb_limit_label} MLBs</div>
+                        <div class="plan-meta">Execuções hoje: {executions_today}{f' / {daily_execution_limit}' if daily_execution_limit is not None else ''}</div>
+                        <div class="plan-meta">Execuções restantes hoje: {executions_remaining_today}</div>
+                        {f'<div class="plan-meta" style="color:#86efac;">{plan_days_left} dias restantes no período atual</div>' if plan_days_left is not None and plan_status == 'trialing' else ''}
+                    </div>
                     <div class="actions">
                         <a class="button-link" href="{new_connect_href}" onclick="return validarNovaConta();"><button class="btn btn-connect" type="button">Conectar nova conta Mercado Livre</button></a>
                         <a class="button-link" href="{reconnect_href}"><button class="btn btn-secondary" type="button">Reconectar seller atual</button></a>
