@@ -2105,6 +2105,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     else:
         require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
+    mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
     current_account_id = int(seller.get("account_id") or accessible_sellers[0]["account_id"])
     current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
     can_manage_access = current_user_role in ("owner", "admin")
