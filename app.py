@@ -1716,6 +1716,17 @@ def auth_google_callback(request: Request):
 
     return response
 
+
+@app.get("/template/sku-min-receber.csv")
+def download_template_min_receive_csv(request: Request):
+    require_user(request)
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
+    return PlainTextResponse(
+        "sku;vlr_min_receber\\nSKU-EXEMPLO-1;120,00\\nSKU-EXEMPLO-2;95,50\\n",
+        media_type="text/csv",
+        headers=headers,
+    )
+
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
     user = require_user(request)
@@ -2282,6 +2293,25 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .sku-file {{
                 flex: 1;
                 font-size: 13px;
+            }}
+
+            /* Mobile */
+            @media (max-width: 980px) {{
+                .sku-header {{
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 8px;
+                }}
+
+                .sku-actions {{
+                    flex-direction: column;
+                    align-items: stretch;
+                }}
+
+                .sku-file,
+                .btn-small {{
+                    width: 100%;
+                }}
             }}
 
 </style>
