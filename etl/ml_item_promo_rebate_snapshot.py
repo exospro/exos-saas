@@ -7,6 +7,7 @@ import random
 import time
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from dotenv import load_dotenv
@@ -25,6 +26,8 @@ DEFAULT_RETRY_BASE_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_BASE_SLE
 DEFAULT_REQUEST_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_REQUEST_SLEEP_SEC", "0.10"))
 DEFAULT_FINAL_REPROCESS = os.environ.get("ML_REBATE_SNAPSHOT_FINAL_REPROCESS", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_MAX_WORKERS = int(os.environ.get("ML_REBATE_SNAPSHOT_MAX_WORKERS", "5"))
+DEFAULT_INSERT_BATCH_SIZE = int(os.environ.get("ML_REBATE_SNAPSHOT_INSERT_BATCH_SIZE", "200"))
 
 
 def to_decimal(value: Any):
@@ -247,12 +250,18 @@ def group_variations(rows: list[dict]) -> dict[str, dict[str, Any]]:
     return grouped
 
 
-def item_promotions(session: requests.Session, connected_seller_id: int, item_id: str):
+def item_promotions(
+    session: requests.Session,
+    connected_seller_id: int,
+    item_id: str,
+    *,
+    headers: dict[str, str],
+):
     url = f"https://api.mercadolibre.com/seller-promotions/items/{item_id}"
     params = {"app_version": APP_VERSION}
     resp = session.get(
         url,
-        headers=get_headers(connected_seller_id),
+        headers=headers,
         params=params,
         timeout=DEFAULT_TIMEOUT,
     )
@@ -302,6 +311,7 @@ def fetch_item_promotions_with_retry(
     connected_seller_id: int,
     mlb: str,
     *,
+    headers: dict[str, str],
     max_attempts: int,
     base_sleep_sec: float,
 ) -> dict[str, Any]:
@@ -313,7 +323,7 @@ def fetch_item_promotions_with_retry(
             print(f"[REBATE][RETRY] mlb={mlb} | tentativa={attempt}/{max_attempts} | aguardando={sleep_for:.2f}s")
             time.sleep(sleep_for)
 
-        result = item_promotions(session, connected_seller_id, mlb)
+        result = item_promotions(session, connected_seller_id, mlb, headers=headers)
         last_result = result
 
         if result["ok"]:
@@ -339,6 +349,7 @@ def reprocess_failed_items(
     promotions_by_item: dict[str, list[dict[str, Any]]],
     failed_items: list[dict[str, Any]],
     *,
+    headers: dict[str, str],
     max_attempts: int,
     base_sleep_sec: float,
     request_sleep_sec: float,
@@ -356,6 +367,7 @@ def reprocess_failed_items(
             session,
             connected_seller_id,
             mlb,
+            headers=headers,
             max_attempts=max_attempts,
             base_sleep_sec=base_sleep_sec,
         )
@@ -542,7 +554,7 @@ def build_insert_rows(
     return rows
 
 
-def insert_rows(conn, rows: list[tuple]) -> int:
+def insert_rows(conn, rows: list[tuple], *, page_size: int = 1000) -> int:
     if not rows:
         return 0
 
@@ -574,7 +586,7 @@ def insert_rows(conn, rows: list[tuple]) -> int:
     ) VALUES %s
     """
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=1000)
+        execute_values(cur, sql, rows, page_size=page_size)
     conn.commit()
     return len(rows)
 
@@ -590,6 +602,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-sleep-sec", type=float, default=DEFAULT_RETRY_BASE_SLEEP_SEC, help="Sleep base para backoff exponencial")
     parser.add_argument("--request-sleep-sec", type=float, default=DEFAULT_REQUEST_SLEEP_SEC, help="Sleep fixo entre MLBs")
     parser.add_argument("--final-reprocess", action=argparse.BooleanOptionalAction, default=DEFAULT_FINAL_REPROCESS, help="Reprocessa no fim apenas MLBs que falharam")
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Quantidade máxima de workers para paralelismo controlado")
+    parser.add_argument("--insert-batch-size", type=int, default=DEFAULT_INSERT_BATCH_SIZE, help="Quantidade de MLBs processados antes de gravar no banco")
     return parser.parse_args()
 
 
@@ -630,40 +644,72 @@ def main() -> None:
             promotions_by_item: dict[str, list[dict[str, Any]]] = {}
             failed_items: list[dict[str, Any]] = []
             mlbs = list(grouped_items.keys())
+            headers = get_headers(connected_seller_id)
+            max_workers = max(1, int(args.max_workers))
+            insert_batch_size = max(1, int(args.insert_batch_size))
+            inserted = 0
 
             print(
                 f"[REBATE] Iniciando snapshot | connected_seller_id={connected_seller_id} | "
                 f"mlb_count={len(grouped_items)} | scope_rows={len(scope_rows)} | max_attempts={args.max_attempts} | "
-                f"request_sleep_sec={args.request_sleep_sec} | final_reprocess={bool(args.final_reprocess)}"
+                f"request_sleep_sec={args.request_sleep_sec} | final_reprocess={bool(args.final_reprocess)} | "
+                f"max_workers={max_workers} | insert_batch_size={insert_batch_size}"
             )
 
-            for idx, mlb in enumerate(mlbs, start=1):
-                result = fetch_item_promotions_with_retry(
-                    session,
-                    connected_seller_id,
-                    mlb,
-                    max_attempts=args.max_attempts,
-                    base_sleep_sec=args.base_sleep_sec,
-                )
-
-                if result["ok"]:
-                    promotions_by_item[mlb] = result["promotions"]
-                else:
-                    promotions_by_item[mlb] = []
-                    failed_items.append(
-                        {
-                            "mlb": mlb,
-                            "error": result["error"],
-                        }
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {}
+                for mlb in mlbs:
+                    future = executor.submit(
+                        fetch_item_promotions_with_retry,
+                        session,
+                        connected_seller_id,
+                        mlb,
+                        headers=headers,
+                        max_attempts=args.max_attempts,
+                        base_sleep_sec=args.base_sleep_sec,
                     )
-                    err = result["error"]
-                    print(f"[REBATE][ERRO] mlb={mlb} | status={err['status_code']} | reason={err['reason']}")
+                    future_map[future] = mlb
+                    if args.request_sleep_sec > 0:
+                        time.sleep(args.request_sleep_sec)
 
-                if idx == 1 or idx % 25 == 0 or idx == len(mlbs):
-                    print(f"[REBATE] {idx}/{len(mlbs)} | mlb={mlb} | failed_items={len(failed_items)}")
+                processed_mlbs: list[str] = []
+                for idx, future in enumerate(as_completed(future_map), start=1):
+                    mlb = future_map[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = {
+                            "ok": False,
+                            "item_id": mlb,
+                            "promotions": [],
+                            "error": {"status_code": None, "reason": "executor_error", "body": {"message": str(exc)}},
+                        }
 
-                if args.request_sleep_sec > 0:
-                    time.sleep(args.request_sleep_sec)
+                    if result["ok"]:
+                        promotions_by_item[mlb] = result["promotions"]
+                    else:
+                        promotions_by_item[mlb] = []
+                        failed_items.append({"mlb": mlb, "error": result["error"]})
+                        err = result["error"]
+                        print(f"[REBATE][ERRO] mlb={mlb} | status={err['status_code']} | reason={err['reason']}")
+
+                    processed_mlbs.append(mlb)
+
+                    if idx == 1 or idx % 10 == 0 or idx == len(mlbs):
+                        print(f"[REBATE] {idx}/{len(mlbs)} | mlb={mlb} | failed_items={len(failed_items)}")
+
+                    if len(processed_mlbs) >= insert_batch_size or idx == len(mlbs):
+                        partial_grouped = {k: grouped_items[k] for k in processed_mlbs}
+                        partial_promotions = {k: promotions_by_item.get(k, []) for k in processed_mlbs}
+                        rows = build_insert_rows(
+                            connected_seller_id=connected_seller_id,
+                            run_id=run_id,
+                            grouped_items=partial_grouped,
+                            promotions_by_item=partial_promotions,
+                        )
+                        inserted += insert_rows(conn, rows, page_size=1000)
+                        print(f"[REBATE] batch gravado | mlbs_batch={len(processed_mlbs)} | rows_inserted_total={inserted}")
+                        processed_mlbs = []
 
             if failed_items and args.final_reprocess:
                 failed_items = reprocess_failed_items(
@@ -671,20 +717,17 @@ def main() -> None:
                     connected_seller_id,
                     promotions_by_item,
                     failed_items,
+                    headers=headers,
                     max_attempts=args.max_attempts,
                     base_sleep_sec=args.base_sleep_sec,
                     request_sleep_sec=args.request_sleep_sec,
                 )
 
-            print(f"[REBATE] Montando linhas para insert | promotions_by_item={len(promotions_by_item)}")
-            rows = build_insert_rows(
-                connected_seller_id=connected_seller_id,
-                run_id=run_id,
-                grouped_items=grouped_items,
-                promotions_by_item=promotions_by_item,
-            )
-            inserted = insert_rows(conn, rows)
 
+            if args.final_reprocess:
+                reprocessed_ok_mlbs = [mlb for mlb in promotions_by_item.keys() if mlb not in {f["mlb"] for f in failed_items}]
+                # Reinserção final apenas para MLBs que falharam e foram resolvidos no reprocessamento não é necessária
+                # porque os dados já foram inseridos no batch inicial. Mantemos totals/falhas consistentes.
             finish_run(
                 conn,
                 run_id,
