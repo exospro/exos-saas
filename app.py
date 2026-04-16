@@ -2312,13 +2312,13 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
                             <div class="sku-actions">
                                 <a href="/template/sku-min-receber.csv" target="_blank">
-                                    <button class="btn btn-secondary">Template</button>
+                                    <button class="btn btn-secondary">Baixar Template</button>
                                 </a>
 
                                 <input type="file" id="minReceiveFile" accept=".csv,.xlsx" />
 
                                 <button class="btn btn-primary" onclick="uploadMinReceive()">
-                                    Enviar
+                                    Enviar arquivo
                                 </button>
                             </div>
 
