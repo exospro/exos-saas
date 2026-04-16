@@ -31,6 +31,7 @@ DEFAULT_TAX_PCT = float(os.environ.get("ML_CAMPAIGN_OPT_TAX_PCT", "0.09"))
 DEFAULT_MAX_MELI_REBATE_PCT = float(os.environ.get("ML_CAMPAIGN_OPT_MAX_MELI_REBATE_PCT", "0.30"))
 DEFAULT_FLUSH_EVERY = int(os.environ.get("ML_CAMPAIGN_OPT_FLUSH_EVERY", "500"))
 DEFAULT_USE_COST = os.environ.get("ML_CAMPAIGN_OPT_USE_COST", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+DEFAULT_INSERT_PAGE_SIZE = int(os.environ.get("ML_CAMPAIGN_OPT_INSERT_PAGE_SIZE", "1000"))
 
 LOG_TABLE_DDL = """
 CREATE SCHEMA IF NOT EXISTS ml;
@@ -163,6 +164,11 @@ def _safe_json(resp: requests.Response):
         return {"_raw": (resp.text or "").strip()[:4000]}
 
 
+
+
+def build_auth_headers(connected_seller_id: int) -> dict[str, str]:
+    return get_headers(connected_seller_id)
+
 def _mk_session(insecure: bool = False) -> requests.Session:
     s = requests.Session()
     retries = Retry(
@@ -200,7 +206,7 @@ def ensure_log_table(conn):
         cur.execute(LOG_TABLE_DDL)
 
 
-def insert_log_rows(conn, rows: list[dict]) -> int:
+def insert_log_rows(conn, rows: list[dict], *, page_size: int = DEFAULT_INSERT_PAGE_SIZE) -> int:
     if not rows:
         return 0
 
@@ -288,7 +294,7 @@ def insert_log_rows(conn, rows: list[dict]) -> int:
     ]
 
     with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=1000)
+        execute_values(cur, sql, values, page_size=page_size)
     return len(rows)
 
 
@@ -512,12 +518,18 @@ def build_scope_items(conn, connected_seller_id: int, source_run_id: int | None 
     return items
 
 
-def item_promotions(session: requests.Session, connected_seller_id: int, item_id: str):
+def item_promotions(
+    session: requests.Session,
+    connected_seller_id: int,
+    item_id: str,
+    *,
+    auth_headers: dict[str, str],
+):
     url = f"https://api.mercadolibre.com/seller-promotions/items/{item_id}"
     params = {"app_version": APP_VERSION}
     resp = session.get(
         url,
-        headers=get_headers(connected_seller_id),
+        headers=auth_headers,
         params=params,
         timeout=DEFAULT_TIMEOUT,
         verify=session.verify,
@@ -552,7 +564,8 @@ def normalize_offer_id(value: Any) -> str | None:
 
 
 def campaign_item_post(session: requests.Session, connected_seller_id: int, campaign_id: str, item_id: str, deal_price: Decimal,
-                       promotion_type: str = "SELLER_CAMPAIGN", offer_id: str | None = None):
+                       promotion_type: str = "SELLER_CAMPAIGN", offer_id: str | None = None, *,
+                       auth_headers: dict[str, str]):
     base_url = f"https://api.mercadolibre.com/seller-promotions/items/{item_id}"
     params = {"app_version": APP_VERSION}
     payload = {
@@ -562,7 +575,7 @@ def campaign_item_post(session: requests.Session, connected_seller_id: int, camp
     }
     if offer_id:
         payload["offer_id"] = offer_id
-    headers = {**get_headers(connected_seller_id), "Content-Type": "application/json"}
+    headers = {**auth_headers, "Content-Type": "application/json"}
     resp = session.post(base_url, headers=headers, json=payload, params=params,
                         timeout=DEFAULT_TIMEOUT, verify=session.verify)
     if 200 <= resp.status_code < 300:
@@ -571,7 +584,8 @@ def campaign_item_post(session: requests.Session, connected_seller_id: int, camp
 
 
 def campaign_item_put(session: requests.Session, connected_seller_id: int, campaign_id: str, item_id: str, deal_price: Decimal,
-                      promotion_type: str = "SELLER_CAMPAIGN", offer_id: str | None = None):
+                      promotion_type: str = "SELLER_CAMPAIGN", offer_id: str | None = None, *,
+                      auth_headers: dict[str, str]):
     base_url = f"https://api.mercadolibre.com/seller-promotions/items/{item_id}"
     params = {"app_version": APP_VERSION}
     payload = {
@@ -581,7 +595,7 @@ def campaign_item_put(session: requests.Session, connected_seller_id: int, campa
     }
     if offer_id:
         payload["offer_id"] = offer_id
-    headers = {**get_headers(connected_seller_id), "Content-Type": "application/json"}
+    headers = {**auth_headers, "Content-Type": "application/json"}
     resp = session.put(base_url, headers=headers, json=payload, params=params,
                        timeout=DEFAULT_TIMEOUT, verify=session.verify)
     if 200 <= resp.status_code < 300:
@@ -590,7 +604,8 @@ def campaign_item_put(session: requests.Session, connected_seller_id: int, campa
 
 
 def campaign_item_upsert(session: requests.Session, connected_seller_id: int, campaign_id: str, item_id: str, deal_price: Decimal,
-                         promotion_type: str = "SELLER_CAMPAIGN", offer_id: str | None = None) -> dict:
+                         promotion_type: str = "SELLER_CAMPAIGN", offer_id: str | None = None, *,
+                         auth_headers: dict[str, str]) -> dict:
     if str(promotion_type).upper() == "SMART" and not offer_id:
         return {
             "ok": False,
@@ -602,13 +617,13 @@ def campaign_item_upsert(session: requests.Session, connected_seller_id: int, ca
 
     r1 = campaign_item_post(
         session, connected_seller_id, campaign_id, item_id, deal_price,
-        promotion_type=promotion_type, offer_id=offer_id
+        promotion_type=promotion_type, offer_id=offer_id, auth_headers=auth_headers
     )
     if r1.get("ok"):
         return {**r1, "error_code": None}
     r2 = campaign_item_put(
         session, connected_seller_id, campaign_id, item_id, deal_price,
-        promotion_type=promotion_type, offer_id=offer_id
+        promotion_type=promotion_type, offer_id=offer_id, auth_headers=auth_headers
     )
     if r2.get("ok"):
         return {**r2, "error_code": None}
@@ -1030,10 +1045,12 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                   use_cost: bool, mlb_filter: set[str] | None = None) -> dict:
     session = _mk_session(insecure=insecure)
     limiter = RateLimiter(rps)
+    auth_headers = build_auth_headers(connected_seller_id)
 
     if mlb_filter:
         items = [item for item in items if item.mlb in mlb_filter]
 
+    items = sorted(items, key=lambda x: (x.mlb, x.variation_id or -1))
     total_items = len(items)
     conn = db_connect()
     run_id = None
@@ -1078,13 +1095,13 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
             nonlocal pending_rows
             if not pending_rows:
                 return
-            insert_log_rows(conn, pending_rows)
+            insert_log_rows(conn, pending_rows, page_size=DEFAULT_INSERT_PAGE_SIZE)
             conn.commit()
             pending_rows = []
 
         def worker(item: ScopeItem):
             limiter.wait()
-            promos = item_promotions(session, connected_seller_id, item.mlb)
+            promos = item_promotions(session, connected_seller_id, item.mlb, auth_headers=auth_headers)
             decision, reason = choose_best_candidate(
                 item,
                 promos,
@@ -1124,6 +1141,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 deal_price=candidate["deal_price"],
                 promotion_type=candidate["promotion_type"],
                 offer_id=candidate.get("offer_id"),
+                auth_headers=auth_headers,
             )
             if api_result.get("ok"):
                 with switch_count_lock:
