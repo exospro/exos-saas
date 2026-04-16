@@ -101,13 +101,14 @@ def extract_real_variation_sku(variation_detail: dict[str, Any]) -> str | None:
     if scf:
         return scf
 
-    user_product_id = variation_detail.get("user_product_id")
-    if user_product_id:
-        return user_product_id
-
     for attr in variation_detail.get("attributes", []) or []:
         if (attr.get("id") or "").upper() == "SELLER_SKU":
-            return attr.get("value_name") or attr.get("value_id")
+            return (
+                attr.get("value_name")
+                or attr.get("value_id")
+                or ((attr.get("values") or [{}])[0].get("name"))
+                or ((attr.get("values") or [{}])[0].get("id"))
+            )
 
     return None
 
@@ -303,10 +304,15 @@ def build_rows(
                 if not seller_sku:
                     for attr in var.get("attributes", []) or []:
                         if (attr.get("id") or "").upper() == "SELLER_SKU":
-                            seller_sku = attr.get("value_name") or attr.get("value_id")
+                            seller_sku = (
+                                attr.get("value_name")
+                                or attr.get("value_id")
+                                or ((attr.get("values") or [{}])[0].get("name"))
+                                or ((attr.get("values") or [{}])[0].get("id"))
+                            )
                             break
 
-                if not seller_sku and variation_id is not None:
+                if variation_id is not None:
                     pending_lookup.append((str(mlb), int(variation_id)))
 
                 rows.append(
@@ -374,7 +380,7 @@ def build_rows(
             mlb = str(row_list[2])
             variation_id = row_list[4]
             current_sku = row_list[5]
-            if variation_id is not None and not current_sku:
+            if variation_id is not None:
                 real_sku = lookup_map.get((mlb, int(variation_id)))
                 if real_sku:
                     row_list[5] = real_sku
