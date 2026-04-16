@@ -2255,42 +2255,35 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 padding: 18px;
             }}
 
+            /* Linha do título */
+            .sku-header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }}
+
+            /* Botões menores */
+            .btn-small {{
+                width: auto;
+                padding: 8px 14px;
+                font-size: 13px;
+                border-radius: 10px;
+            }}
+
+            /* Linha de upload */
             .sku-actions {{
                 display: flex;
                 align-items: center;
-                gap: 12px;
-                margin-top: 14px;
-                flex-wrap: wrap;
+                gap: 10px;
+                margin-top: 12px;
             }}
 
-            .sku-btn {{
-                width: auto;
-                min-width: 170px;
-                padding: 12px 18px;
-                font-size: 15px;
-                line-height: 1.2;
-                white-space: nowrap;
-            }}
-
+            /* Input ocupa espaço */
             .sku-file {{
                 flex: 1;
-                min-width: 260px;
-                font-size: 14px;
-                color: #e8eeff;
+                font-size: 13px;
             }}
 
-            @media (max-width: 980px) {{
-                .sku-actions {{
-                    flex-direction: column;
-                    align-items: stretch;
-                }}
-
-                .sku-btn,
-                .sku-file {{
-                    width: 100%;
-                    min-width: 0;
-                }}
-            }}
 </style>
     </head>
     <body>
@@ -2335,22 +2328,29 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <label>Conta ativa</label>
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
                         <div class="card compact" style="margin-top:20px;">
-                            <h2>SKU mínimo</h2>
+
+                            <div class="sku-header">
+                                <h2>SKU mínimo</h2>
+
+                                <a href="/template/sku-min-receber.csv" target="_blank" class="button-link">
+                                    <button class="btn btn-secondary btn-small" type="button">
+                                        Baixar template
+                                    </button>
+                                </a>
+                            </div>
+
                             <div class="muted">Upload de SKU x valor mínimo a receber</div>
 
                             <div class="sku-actions">
-                                <a href="/template/sku-min-receber.csv" target="_blank" class="button-link">
-                                    <button class="btn btn-secondary sku-btn" type="button">Baixar template</button>
-                                </a>
-
                                 <input type="file" id="minReceiveFile" accept=".csv,.xlsx" class="sku-file" />
 
-                                <button class="btn btn-primary sku-btn" type="button" onclick="uploadMinReceive()">
+                                <button class="btn btn-primary btn-small" type="button" onclick="uploadMinReceive()">
                                     Enviar arquivo
                                 </button>
                             </div>
 
                             <div class="muted" id="minReceiveInfo" style="margin-top:10px;"></div>
+
                         </div>
 
                         <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
