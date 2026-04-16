@@ -1,5 +1,5 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse, Response
 import os
 import re
 import time
@@ -8,9 +8,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, quote
 import secrets
+import io
+import csv
 from psycopg2.extras import Json, RealDictCursor
 
 import requests
+from openpyxl import load_workbook, Workbook
 
 from etl.inventory.repository import db_connect
 
@@ -43,6 +46,10 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
+
+
+SKU_MIN_RECEIVE_TEMPLATE_CSV = "sku;vlr_min_receber\nEXEMPLO-SKU-001;120,00\nEXEMPLO-SKU-002;89,90\n"
+
 
 
 
@@ -358,6 +365,163 @@ def register_daily_execution(account_id: int) -> dict:
     return dict(row)
 
 
+
+
+def ensure_account_sku_min_receive_table() -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app.account_sku_min_receive (
+                    id BIGSERIAL PRIMARY KEY,
+                    account_id BIGINT NOT NULL,
+                    sku TEXT NOT NULL,
+                    vlr_min_receber NUMERIC(18,2) NOT NULL,
+                    source_file_name TEXT,
+                    uploaded_by_user_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (account_id, sku)
+                )
+                """
+            )
+        conn.commit()
+
+
+def parse_brl_decimal(value) -> float | None:
+    if value in (None, "", []):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("R$", "").replace(" ", "")
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def normalize_upload_headers(headers: list) -> dict[str, int]:
+    out = {}
+    for idx, h in enumerate(headers):
+        key = str(h or "").strip().lower()
+        if key:
+            out[key] = idx
+    return out
+
+
+def parse_sku_min_receive_upload(filename: str, content: bytes) -> list[dict]:
+    ext = (Path(filename or "").suffix or "").lower()
+    rows: list[dict] = []
+
+    if ext == ".xlsx":
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        data = list(ws.iter_rows(values_only=True))
+        if not data:
+            raise HTTPException(status_code=400, detail="Arquivo XLSX vazio.")
+        headers = normalize_upload_headers(list(data[0]))
+        if "sku" not in headers or "vlr_min_receber" not in headers:
+            raise HTTPException(status_code=400, detail="O arquivo deve conter as colunas sku e vlr_min_receber.")
+        for row in data[1:]:
+            sku = str(row[headers["sku"]] or "").strip()
+            val = parse_brl_decimal(row[headers["vlr_min_receber"]])
+            if not sku and val is None:
+                continue
+            if not sku:
+                raise HTTPException(status_code=400, detail="Existe linha sem SKU no arquivo.")
+            if val is None:
+                raise HTTPException(status_code=400, detail=f"SKU {sku} com vlr_min_receber inválido.")
+            rows.append({"sku": sku, "vlr_min_receber": val})
+        return rows
+
+    sample = content.decode("utf-8-sig", errors="ignore")
+    delim = ";" if sample.count(";") >= sample.count(",") else ","
+    reader = csv.DictReader(io.StringIO(sample), delimiter=delim)
+    lowered = {str(h or "").strip().lower(): h for h in (reader.fieldnames or [])}
+    if "sku" not in lowered or "vlr_min_receber" not in lowered:
+        raise HTTPException(status_code=400, detail="O arquivo deve conter as colunas sku e vlr_min_receber.")
+
+    sku_field = lowered["sku"]
+    value_field = lowered["vlr_min_receber"]
+    for rec in reader:
+        sku = str(rec.get(sku_field) or "").strip()
+        val = parse_brl_decimal(rec.get(value_field))
+        if not sku and val is None:
+            continue
+        if not sku:
+            raise HTTPException(status_code=400, detail="Existe linha sem SKU no arquivo.")
+        if val is None:
+            raise HTTPException(status_code=400, detail=f"SKU {sku} com vlr_min_receber inválido.")
+        rows.append({"sku": sku, "vlr_min_receber": val})
+    return rows
+
+
+def replace_account_sku_min_receive(account_id: int, user_account_id: int, source_file_name: str, rows: list[dict]) -> dict:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
+            values = [
+                (
+                    account_id,
+                    str(r["sku"]).strip(),
+                    r["vlr_min_receber"],
+                    source_file_name,
+                    user_account_id,
+                )
+                for r in rows
+            ]
+            if values:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO app.account_sku_min_receive (
+                        account_id, sku, vlr_min_receber, source_file_name, uploaded_by_user_id
+                    ) VALUES %s
+                    """,
+                    values,
+                    template="(%s,%s,%s,%s,%s)",
+                    page_size=500,
+                )
+        conn.commit()
+    return {"rows_saved": len(rows), "source_file_name": source_file_name}
+
+
+def list_account_sku_min_receive(account_id: int, limit: int = 20) -> list[dict]:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT sku, vlr_min_receber, source_file_name, uploaded_by_user_id, created_at, updated_at
+                FROM app.account_sku_min_receive
+                WHERE account_id = %s
+                ORDER BY sku
+                LIMIT %s
+                """,
+                (account_id, limit),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_account_sku_min_receive(account_id: int) -> int:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s",
+                (account_id,),
+            )
+            row = cur.fetchone()
+    return int(row[0] or 0)
 
 def get_session_user(request: Request) -> dict | None:
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
@@ -1004,37 +1168,6 @@ def get_connected_seller_summary(connected_seller_id: int) -> dict:
     }
 
 
-
-
-def get_connected_seller_mlb_stats(connected_seller_id: int) -> dict:
-    with db_connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                WITH last_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT
-                    count(DISTINCT mlb) AS total_mlbs,
-                    count(DISTINCT CASE WHEN status = 'active' THEN mlb END) AS active_mlbs,
-                    count(DISTINCT CASE WHEN status = 'paused' THEN mlb END) AS paused_mlbs
-                FROM ml.inventory_snapshot_item i
-                JOIN last_run r
-                  ON i.run_id = r.run_id
-                WHERE i.connected_seller_id = %s
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            row = cur.fetchone() or {}
-
-    return {
-        "total_mlbs": int(row.get("total_mlbs") or 0),
-        "active_mlbs": int(row.get("active_mlbs") or 0),
-        "paused_mlbs": int(row.get("paused_mlbs") or 0),
-    }
-
 def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1173,8 +1306,8 @@ def build_inventory_cmd(connected_seller_id: int, limit_items: int) -> list[str]
         "--connected-seller-id",
         str(connected_seller_id),
     ]
-    #if limit_items and limit_items > 0:
-    #    cmd.extend(["--limit-items", str(limit_items)])
+    if limit_items and limit_items > 0:
+        cmd.extend(["--limit-items", str(limit_items)])
     return cmd
 
 
@@ -2019,6 +2152,58 @@ def active_job(request: Request, connected_seller_id: int):
     return {"active": active}
 
 
+
+@app.get("/template/sku-min-receber.csv")
+def download_sku_min_receive_template_csv(request: Request):
+    require_user(request)
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_vlr_min_receber.csv"'}
+    return PlainTextResponse(SKU_MIN_RECEIVE_TEMPLATE_CSV, media_type="text/csv", headers=headers)
+
+
+@app.get("/template/sku-min-receber.xlsx")
+def download_sku_min_receive_template_xlsx(request: Request):
+    require_user(request)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "template"
+    ws.append(["sku", "vlr_min_receber"])
+    ws.append(["EXEMPLO-SKU-001", 120.00])
+    ws.append(["EXEMPLO-SKU-002", 89.90])
+    bio = io.BytesIO()
+    wb.save(bio)
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_vlr_min_receber.xlsx"'}
+    return Response(content=bio.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+
+
+@app.get("/account/sku-min-receber/list")
+def account_sku_min_receive_list(request: Request, account_id: int, limit: int = 20):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, allowed_roles=("owner", "admin", "viewer"))
+    return {
+        "count": count_account_sku_min_receive(account_id),
+        "rows": list_account_sku_min_receive(account_id, limit=limit),
+    }
+
+
+@app.post("/account/sku-min-receber/upload")
+async def account_sku_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, allowed_roles=("owner", "admin"))
+    filename = file.filename or "upload.csv"
+    if not filename.lower().endswith((".csv", ".xlsx")):
+        raise HTTPException(status_code=400, detail="Envie um arquivo CSV ou XLSX.")
+    content = await file.read()
+    rows = parse_sku_min_receive_upload(filename, content)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Arquivo sem linhas válidas.")
+    result = replace_account_sku_min_receive(
+        account_id=account_id,
+        user_account_id=int(user["id"]),
+        source_file_name=filename,
+        rows=rows,
+    )
+    return {"ok": True, **result}
+
 @app.get("/painel", response_class=HTMLResponse)
 def painel(request: Request, connected_seller_id: int | None = None, connected: int = 0, account_id: int | None = None):
     user = require_user(request)
@@ -2030,10 +2215,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     else:
         require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
-    mlb_stats = get_connected_seller_mlb_stats(connected_seller_id)
     current_account_id = int(seller.get("account_id") or accessible_sellers[0]["account_id"])
     current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
     can_manage_access = current_user_role in ("owner", "admin")
+    sku_min_receive_count = count_account_sku_min_receive(current_account_id)
 
     subscription = get_or_create_subscription(current_account_id)
     plan_name = "-"
@@ -2090,22 +2275,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             <div class="status-line"><strong>Conta:</strong> {seller.get('seller_nickname') or '-'}</div>
             <div class="status-line"><strong>ML User ID:</strong> {seller.get('ml_user_id') or '-'}</div>
             <div class="status-line"><strong>Site:</strong> {seller.get('site_id') or '-'}</div>
-            <div class="status-line"><strong>Connected Seller ID:</strong> {seller.get('connected_seller_id') or '-'}</div>
-
-            <div class="mlb-stats-grid">
-                <div class="mlb-stat-box">
-                    <div class="mlb-stat-value">{mlb_stats["total_mlbs"]}</div>
-                    <div class="mlb-stat-label">MLBs totais</div>
-                </div>
-                <div class="mlb-stat-box">
-                    <div class="mlb-stat-value">{mlb_stats["active_mlbs"]}</div>
-                    <div class="mlb-stat-label">Ativos</div>
-                </div>
-                <div class="mlb-stat-box">
-                    <div class="mlb-stat-value">{mlb_stats["paused_mlbs"]}</div>
-                    <div class="mlb-stat-label">Pausados</div>
-                </div>
-            </div>
         </div>
         """
     else:
@@ -2255,10 +2424,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
-            .mlb-stats-grid {{ display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:12px; margin-top:16px; }}
-            .mlb-stat-box {{ padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); text-align:center; }}
-            .mlb-stat-value {{ font-size:24px; font-weight:800; color:#ffffff; line-height:1; }}
-            .mlb-stat-label {{ margin-top:6px; font-size:12px; color:#9fb0d9; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
         </style>
     </head>
@@ -2363,6 +2528,32 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 </div>
                 <div class="invite-list" id="inviteList">Carregando acessos...</div>
             </div>
+
+            <div class="card" style="margin-top:20px;">
+                <h2>Arquivo de valor mínimo a receber</h2>
+                <div class="muted">Faça upload de um CSV ou XLSX com as colunas <strong>sku</strong> e <strong>vlr_min_receber</strong>. Esse cadastro será usado nas próximas regras do optimizer.</div>
+                <div class="plan-card" style="margin-top:16px;">
+                    <div class="plan-label">Registros cadastrados</div>
+                    <div class="plan-name">{sku_min_receive_count}</div>
+                    <div class="plan-meta">Conta atual: {seller.get('seller_nickname') or '-'}</div>
+                </div>
+                <div class="actions" style="margin-top:16px;">
+                    <div class="small-grid">
+                        <a class="button-link" href="/template/sku-min-receber.csv" target="_blank"><button class="btn btn-secondary" type="button">Baixar template CSV</button></a>
+                        <a class="button-link" href="/template/sku-min-receber.xlsx" target="_blank"><button class="btn btn-secondary" type="button">Baixar template XLSX</button></a>
+                    </div>
+                </div>
+                <div id="skuUploadArea" style="margin-top:16px;">
+                    <div class="form-row">
+                        <label>Subir arquivo CSV/XLSX</label>
+                        <input type="file" id="skuMinReceiveFile" accept=".csv,.xlsx" />
+                    </div>
+                    <button class="btn btn-primary" type="button" onclick="uploadSkuMinReceive()">Enviar arquivo</button>
+                    <div class="muted" id="skuUploadInfo"></div>
+                </div>
+                <div class="invite-list" id="skuMinReceiveList" style="margin-top:16px;">Carregando registros...</div>
+            </div>
+
             <div class="output-wrap">
                 <div class="output-head">
                     <h2>Resultado / Log</h2>
@@ -2381,6 +2572,65 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 if (!hasAccount) {{ alert("Abra o painel com ?account_id=SEU_ID antes de conectar uma nova conta."); return false; }}
                 return true;
             }}
+
+
+            async function refreshSkuMinReceiveList() {
+                const accountId = document.getElementById('currentAccountId')?.value;
+                const root = document.getElementById('skuMinReceiveList');
+                if (!accountId || !root) return;
+                try {
+                    const data = await fetchJson(`/account/sku-min-receber/list?account_id=${encodeURIComponent(accountId)}&limit=20`);
+                    const rows = data.rows || [];
+                    const count = data.count || 0;
+                    const info = document.getElementById('skuUploadInfo');
+                    if (info) info.innerText = `${count} registro(s) cadastrado(s).`;
+                    if (!rows.length) {
+                        root.innerHTML = '<div class="muted">Nenhum SKU com valor mínimo a receber cadastrado ainda.</div>';
+                        return;
+                    }
+                    root.innerHTML = rows.map(r => `
+                        <div class="invite-item">
+                            <div>
+                                <div><strong>${r.sku}</strong> — R$ ${String(r.vlr_min_receber).replace(".", ",")}</div>
+                                <div class="invite-meta">arquivo=${r.source_file_name || '-'} | atualizado em ${fmtDate(r.updated_at)}</div>
+                            </div>
+                        </div>
+                    `).join('');
+                } catch (e) {
+                    root.innerHTML = `<div class="muted">${String(e)}</div>`;
+                }
+            }
+
+            async function uploadSkuMinReceive() {
+                const accountId = document.getElementById('currentAccountId')?.value;
+                const input = document.getElementById('skuMinReceiveFile');
+                const info = document.getElementById('skuUploadInfo');
+                if (!accountId || !input || !input.files || !input.files.length) {
+                    alert('Selecione um arquivo CSV ou XLSX.');
+                    return;
+                }
+                const form = new FormData();
+                form.append('file', input.files[0]);
+                info.innerText = 'Enviando arquivo...';
+                try {
+                    const res = await fetch(`/account/sku-min-receber/upload?account_id=${encodeURIComponent(accountId)}`, {
+                        method: 'POST',
+                        body: form
+                    });
+                    const text = await res.text();
+                    let data = {};
+                    try { data = JSON.parse(text); } catch(e) {}
+                    if (!res.ok) {
+                        throw new Error((data && data.detail) ? data.detail : text);
+                    }
+                    info.innerText = `Upload concluído. ${data.rows_saved || 0} linha(s) salvas.`;
+                    input.value = '';
+                    await refreshSkuMinReceiveList();
+                } catch (e) {
+                    info.innerText = String(e);
+                    alert(String(e));
+                }
+            }
 
             function toggleLimitInput() {{}}
 
@@ -2604,6 +2854,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             toggleLimitInput();
             refreshRecentJobs();
             refreshInvites();
+            refreshSkuMinReceiveList();
         </script>
     </body>
     </html>
