@@ -2255,10 +2255,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
-            .mlb-stats-grid {{ display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:12px; margin-top:16px; }}
-            .mlb-stat-box {{ padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); text-align:center; }}
-            .mlb-stat-value {{ font-size:24px; font-weight:800; color:#ffffff; line-height:1; }}
-            .mlb-stat-label {{ margin-top:6px; font-size:12px; color:#9fb0d9; }}
+            .mlb-stats-grid { display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:12px; margin-top:16px; }
+            .mlb-stat-box { padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); text-align:center; }
+            .mlb-stat-value { font-size:24px; font-weight:800; color:#ffffff; line-height:1; }
+            .mlb-stat-label { margin-top:6px; font-size:12px; color:#9fb0d9; }
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
         </style>
     </head>
