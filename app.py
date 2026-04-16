@@ -1004,37 +1004,6 @@ def get_connected_seller_summary(connected_seller_id: int) -> dict:
     }
 
 
-
-
-def get_connected_seller_mlb_stats(connected_seller_id: int) -> dict:
-    with db_connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                WITH last_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT
-                    count(DISTINCT mlb) AS total_mlbs,
-                    count(DISTINCT CASE WHEN status = 'active' THEN mlb END) AS active_mlbs,
-                    count(DISTINCT CASE WHEN status = 'paused' THEN mlb END) AS paused_mlbs
-                FROM ml.inventory_snapshot_item i
-                JOIN last_run r
-                  ON i.run_id = r.run_id
-                WHERE i.connected_seller_id = %s
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            row = cur.fetchone() or {}
-
-    return {
-        "total_mlbs": int(row.get("total_mlbs") or 0),
-        "active_mlbs": int(row.get("active_mlbs") or 0),
-        "paused_mlbs": int(row.get("paused_mlbs") or 0),
-    }
-
 def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2030,7 +1999,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     else:
         require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
-    mlb_stats = get_connected_seller_mlb_stats(connected_seller_id)
     current_account_id = int(seller.get("account_id") or accessible_sellers[0]["account_id"])
     current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
     can_manage_access = current_user_role in ("owner", "admin")
@@ -2090,22 +2058,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             <div class="status-line"><strong>Conta:</strong> {seller.get('seller_nickname') or '-'}</div>
             <div class="status-line"><strong>ML User ID:</strong> {seller.get('ml_user_id') or '-'}</div>
             <div class="status-line"><strong>Site:</strong> {seller.get('site_id') or '-'}</div>
-            <div class="status-line"><strong>Connected Seller ID:</strong> {seller.get('connected_seller_id') or '-'}</div>
-
-            <div class="mlb-stats-grid">
-                <div class="mlb-stat-box">
-                    <div class="mlb-stat-value">{mlb_stats["total_mlbs"]}</div>
-                    <div class="mlb-stat-label">MLBs totais</div>
-                </div>
-                <div class="mlb-stat-box">
-                    <div class="mlb-stat-value">{mlb_stats["active_mlbs"]}</div>
-                    <div class="mlb-stat-label">Ativos</div>
-                </div>
-                <div class="mlb-stat-box">
-                    <div class="mlb-stat-value">{mlb_stats["paused_mlbs"]}</div>
-                    <div class="mlb-stat-label">Pausados</div>
-                </div>
-            </div>
         </div>
         """
     else:
@@ -2255,10 +2207,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
-            .mlb-stats-grid { display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:12px; margin-top:16px; }
-            .mlb-stat-box { padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); text-align:center; }
-            .mlb-stat-value { font-size:24px; font-weight:800; color:#ffffff; line-height:1; }
-            .mlb-stat-label { margin-top:6px; font-size:12px; color:#9fb0d9; }
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
         </style>
     </head>
@@ -2608,3 +2556,36 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     </body>
     </html>
     """
+
+# =========================
+# MLB STATS (PAINEL)
+# =========================
+from psycopg2.extras import RealDictCursor
+
+def get_connected_seller_mlb_stats(connected_seller_id: int) -> dict:
+    sql = """
+    WITH last_run AS (
+        SELECT max(run_id) AS run_id
+        FROM ml.inventory_snapshot_item
+        WHERE connected_seller_id = %s
+    )
+    SELECT
+        count(DISTINCT mlb) AS total_mlbs,
+        count(DISTINCT CASE WHEN status = 'active' THEN mlb END) AS active_mlbs,
+        count(DISTINCT CASE WHEN status = 'paused' THEN mlb END) AS paused_mlbs
+    FROM ml.inventory_snapshot_item i
+    JOIN last_run r
+      ON i.run_id = r.run_id
+    WHERE i.connected_seller_id = %s
+    """
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (connected_seller_id, connected_seller_id))
+            row = cur.fetchone() or {}
+
+    return {
+        "total_mlbs": int(row.get("total_mlbs") or 0),
+        "active_mlbs": int(row.get("active_mlbs") or 0),
+        "paused_mlbs": int(row.get("paused_mlbs") or 0),
+    }
