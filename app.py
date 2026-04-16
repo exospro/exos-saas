@@ -2218,11 +2218,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
-        
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
+            .card.compact {{padding: 16px;min-height: unset;}}
 </style>
     </head>
     <body>
