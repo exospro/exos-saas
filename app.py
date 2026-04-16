@@ -2251,17 +2251,45 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .metrics.metrics-3 {{ grid-template-columns: 1fr; }} .hero h1 {{ font-size: 40px; }} }}
-            .card.compact {{padding: 14px;min-height: unset;}}
+            .card.compact {{
+                padding: 18px;
+            }}
+
             .sku-actions {{
                 display: flex;
                 align-items: center;
-                gap: 10px;
-                margin-top: 12px;
+                gap: 12px;
+                margin-top: 14px;
+                flex-wrap: wrap;
             }}
 
-            .sku-actions input[type="file"] {{
+            .sku-btn {{
+                width: auto;
+                min-width: 170px;
+                padding: 12px 18px;
+                font-size: 15px;
+                line-height: 1.2;
+                white-space: nowrap;
+            }}
+
+            .sku-file {{
                 flex: 1;
-                font-size: 12px;
+                min-width: 260px;
+                font-size: 14px;
+                color: #e8eeff;
+            }}
+
+            @media (max-width: 980px) {{
+                .sku-actions {{
+                    flex-direction: column;
+                    align-items: stretch;
+                }}
+
+                .sku-btn,
+                .sku-file {{
+                    width: 100%;
+                    min-width: 0;
+                }
             }}
 </style>
     </head>
@@ -2308,21 +2336,21 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
                         <div class="card compact" style="margin-top:20px;">
                             <h2>SKU mínimo</h2>
-                            <div class="muted">Upload SKU x valor mínimo</div>
+                            <div class="muted">Upload de SKU x valor mínimo a receber</div>
 
                             <div class="sku-actions">
-                                <a href="/template/sku-min-receber.csv" target="_blank">
-                                    <button class="btn btn-secondary">Baixar Template</button>
+                                <a href="/template/sku-min-receber.csv" target="_blank" class="button-link">
+                                    <button class="btn btn-secondary sku-btn" type="button">Baixar template</button>
                                 </a>
 
-                                <input type="file" id="minReceiveFile" accept=".csv,.xlsx" />
+                                <input type="file" id="minReceiveFile" accept=".csv,.xlsx" class="sku-file" />
 
-                                <button class="btn btn-primary" onclick="uploadMinReceive()">
+                                <button class="btn btn-primary sku-btn" type="button" onclick="uploadMinReceive()">
                                     Enviar arquivo
                                 </button>
                             </div>
 
-                            <div class="muted" id="minReceiveInfo" style="margin-top:8px;"></div>
+                            <div class="muted" id="minReceiveInfo" style="margin-top:10px;"></div>
                         </div>
 
                         <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
