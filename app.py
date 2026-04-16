@@ -13,10 +13,9 @@ from psycopg2.extras import Json, RealDictCursor
 import requests
 
 from etl.inventory.repository import db_connect
-from etl.ml_auth_db_multi import get_headers as ml_get_headers
 
 app = FastAPI()
-#...
+#.
 
 ML_CLIENT_ID = os.environ["ML_CLIENT_ID"]
 ML_CLIENT_SECRET = os.environ["ML_CLIENT_SECRET"]
@@ -1007,118 +1006,33 @@ def get_connected_seller_summary(connected_seller_id: int) -> dict:
 
 
 
-def ensure_connected_seller_stats_cache_table() -> None:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ml.connected_seller_stats_cache (
-                    connected_seller_id BIGINT PRIMARY KEY,
-                    total_mlbs INTEGER NOT NULL DEFAULT 0,
-                    active_mlbs INTEGER NOT NULL DEFAULT 0,
-                    paused_mlbs INTEGER NOT NULL DEFAULT 0,
-                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-        conn.commit()
-
-
-def _ml_items_total_online(ml_user_id: int, headers: dict, status: str | None = None) -> int:
-    url = f"https://api.mercadolibre.com/users/{ml_user_id}/items/search"
-    params = {}
-    if status:
-        params["status"] = status
-
-    resp = requests.get(url, headers=headers, params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json() or {}
-    paging = data.get("paging") or {}
-    return int(paging.get("total") or 0)
-
-
-def get_connected_seller_mlb_stats_live(connected_seller_id: int, cache_minutes: int = 10) -> dict:
-    ensure_connected_seller_stats_cache_table()
-
-    seller = get_connected_seller_summary(connected_seller_id)
-    try:
-        mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
-    except Exception as e:
-        print("ERRO ML STATS:", e)
-        mlb_stats = {
-            "total_mlbs": 0,
-            "active_mlbs": 0,
-            "paused_mlbs": 0,
-            "source": "error",
-            "fetched_at": None,
-        }
-
-    if not seller.get("connected") or not seller.get("ml_user_id"):
-        return {
-            "total_mlbs": 0,
-            "active_mlbs": 0,
-            "paused_mlbs": 0,
-            "source": "unavailable",
-            "fetched_at": None,
-        }
-
+def get_connected_seller_mlb_stats(connected_seller_id: int) -> dict:
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT connected_seller_id, total_mlbs, active_mlbs, paused_mlbs, fetched_at
-                FROM ml.connected_seller_stats_cache
-                WHERE connected_seller_id = %s
-                """,
-                (connected_seller_id,),
-            )
-            cached = cur.fetchone()
-
-    now_utc = utc_now()
-    if cached and cached.get("fetched_at"):
-        age = now_utc - cached["fetched_at"]
-        if age <= timedelta(minutes=cache_minutes):
-            return {
-                "total_mlbs": int(cached.get("total_mlbs") or 0),
-                "active_mlbs": int(cached.get("active_mlbs") or 0),
-                "paused_mlbs": int(cached.get("paused_mlbs") or 0),
-                "source": "cache",
-                "fetched_at": cached.get("fetched_at"),
-            }
-
-    headers = ml_get_headers(connected_seller_id)
-    total_mlbs = _ml_items_total_online(int(seller["ml_user_id"]), headers, None)
-    active_mlbs = _ml_items_total_online(int(seller["ml_user_id"]), headers, "active")
-    paused_mlbs = _ml_items_total_online(int(seller["ml_user_id"]), headers, "paused")
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ml.connected_seller_stats_cache (
-                    connected_seller_id, total_mlbs, active_mlbs, paused_mlbs, fetched_at, created_at, updated_at
+                WITH last_run AS (
+                    SELECT max(run_id) AS run_id
+                    FROM ml.inventory_snapshot_item
+                    WHERE connected_seller_id = %s
                 )
-                VALUES (%s, %s, %s, %s, now(), now(), now())
-                ON CONFLICT (connected_seller_id)
-                DO UPDATE SET
-                    total_mlbs = EXCLUDED.total_mlbs,
-                    active_mlbs = EXCLUDED.active_mlbs,
-                    paused_mlbs = EXCLUDED.paused_mlbs,
-                    fetched_at = now(),
-                    updated_at = now()
+                SELECT
+                    count(DISTINCT mlb) AS total_mlbs,
+                    count(DISTINCT CASE WHEN status = 'active' THEN mlb END) AS active_mlbs,
+                    count(DISTINCT CASE WHEN status = 'paused' THEN mlb END) AS paused_mlbs
+                FROM ml.inventory_snapshot_item i
+                JOIN last_run r
+                  ON i.run_id = r.run_id
+                WHERE i.connected_seller_id = %s
                 """,
-                (connected_seller_id, total_mlbs, active_mlbs, paused_mlbs),
+                (connected_seller_id, connected_seller_id),
             )
-        conn.commit()
+            row = cur.fetchone() or {}
 
     return {
-        "total_mlbs": int(total_mlbs),
-        "active_mlbs": int(active_mlbs),
-        "paused_mlbs": int(paused_mlbs),
-        "source": "live",
-        "fetched_at": now_utc,
+        "total_mlbs": int(row.get("total_mlbs") or 0),
+        "active_mlbs": int(row.get("active_mlbs") or 0),
+        "paused_mlbs": int(row.get("paused_mlbs") or 0),
     }
 
 def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
@@ -2116,19 +2030,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     else:
         require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
-
-    try:
-        mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
-    except Exception as e:
-        print("ERRO ML STATS:", e)
-        mlb_stats = {
-            "total_mlbs": 0,
-            "active_mlbs": 0,
-            "paused_mlbs": 0,
-            "source": "fallback",
-            "fetched_at": None,
-        }
-
+    mlb_stats = get_connected_seller_mlb_stats(connected_seller_id)
     current_account_id = int(seller.get("account_id") or accessible_sellers[0]["account_id"])
     current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
     can_manage_access = current_user_role in ("owner", "admin")
@@ -2146,7 +2048,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
     inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
     inventory_plan_warning = ""
-    coverage_pct = None
 
     if subscription:
         subscription = expire_trial_if_needed(subscription)
@@ -2162,15 +2063,13 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 mlb_limit_label = str(default_limit)
                 limit_label = f"{default_limit} MLBs"
 
-                total_live_mlbs = int(mlb_stats.get("total_mlbs") or 0)
-                if total_live_mlbs > 0:
-                    coverage_pct = round((default_limit / total_live_mlbs) * 100, 1)
-
-                if total_live_mlbs > default_limit:
-                    excedente = total_live_mlbs - default_limit
+                if inventory_item_count is not None and inventory_item_count > default_limit:
+                    excedente = inventory_item_count - default_limit
                     inventory_plan_warning = (
-                        f"Sua conta tem {total_live_mlbs} MLBs online e seu plano atual cobre até {default_limit} MLBs por execução. "
-                        f"{excedente} MLBs ficarão fora da cobertura total da otimização."
+                        f"Sua conta tem {inventory_item_count} MLBs ativos mapeados no último inventory, "
+                        f"acima do limite do plano atual ({default_limit}). "
+                        f"Rebate, Optimizer e Otimização Completa serão limitados ao plano. "
+                        f"Excedente estimado: {excedente} MLBs."
                     )
 
             daily_execution_limit = subscription.get("daily_execution_limit")
@@ -2184,9 +2083,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 delta = subscription["current_period_end"] - now_utc
                 plan_days_left = max(delta.days, 0)
 
-    stats_source_label = "online" if mlb_stats.get("source") == "live" else "cache 10 min"
-    stats_updated_label = fmt_dt(mlb_stats.get("fetched_at")) if mlb_stats.get("fetched_at") else "-"
-
     if seller["connected"]:
         status_html = f"""
         <div class="status-card connected">
@@ -2194,6 +2090,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             <div class="status-line"><strong>Conta:</strong> {seller.get('seller_nickname') or '-'}</div>
             <div class="status-line"><strong>ML User ID:</strong> {seller.get('ml_user_id') or '-'}</div>
             <div class="status-line"><strong>Site:</strong> {seller.get('site_id') or '-'}</div>
+            <div class="status-line"><strong>Connected Seller ID:</strong> {seller.get('connected_seller_id') or '-'}</div>
 
             <div class="mlb-stats-grid">
                 <div class="mlb-stat-box">
@@ -2208,10 +2105,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <div class="mlb-stat-value">{mlb_stats["paused_mlbs"]}</div>
                     <div class="mlb-stat-label">Pausados</div>
                 </div>
-            </div>
-
-            <div class="status-micro">
-              Origem: {stats_source_label} • Atualizado em: {stats_updated_label}
             </div>
         </div>
         """
@@ -2242,15 +2135,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
         background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.4);
         color:#fecaca;text-align:center;font-weight:700;">
         🚫 Seu teste expirou • Assine um plano para continuar
-        </div>
-        '''
-
-    plan_coverage_html = ""
-    if inventory_plan_warning:
-        coverage_extra = f" Cobertura estimada do plano: {coverage_pct}%." if coverage_pct is not None else ""
-        plan_coverage_html = f'''
-        <div class="flash warning">
-            ⚠️ {inventory_plan_warning}{coverage_extra}
         </div>
         '''
 
@@ -2371,6 +2255,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
+            .mlb-stats-grid { display:grid; grid-template-columns:repeat(3,minmax(100px,1fr)); gap:12px; margin-top:16px; }
+            .mlb-stat-box { padding:12px 14px; border-radius:14px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); text-align:center; }
+            .mlb-stat-value { font-size:24px; font-weight:800; color:#ffffff; line-height:1; }
+            .mlb-stat-label { margin-top:6px; font-size:12px; color:#9fb0d9; }
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
         </style>
     </head>
