@@ -2289,7 +2289,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 .sku-file {{
                     width: 100%;
                     min-width: 0;
-                }
+                }}
             }}
 </style>
     </head>
