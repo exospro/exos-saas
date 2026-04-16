@@ -2251,7 +2251,18 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .metrics.metrics-3 {{ grid-template-columns: 1fr; }} .hero h1 {{ font-size: 40px; }} }}
-            .card.compact {{padding: 16px;min-height: unset;}}
+            .card.compact {{padding: 14px;min-height: unset;}}
+            .sku-actions {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-top: 12px;
+            }}
+
+            .sku-actions input[type="file"] {{
+                flex: 1;
+                font-size: 12px;
+            }}
 </style>
     </head>
     <body>
@@ -2295,24 +2306,24 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <div class="form-row">
                         <label>Conta ativa</label>
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
-<div class="card compact">
-    <h2>SKU mínimo</h2>
-    <div class="muted">Upload SKU x valor mínimo</div>
+                        <div class="card compact" style="margin-top:20px;">
+                            <h2>SKU mínimo</h2>
+                            <div class="muted">Upload SKU x valor mínimo</div>
 
-    <div style="margin-top:10px;">
-        <a href="/template/sku-min-receber.csv" target="_blank">
-            <button class="btn btn-secondary">Template</button>
-        </a>
-    </div>
+                            <div class="sku-actions">
+                                <a href="/template/sku-min-receber.csv" target="_blank">
+                                    <button class="btn btn-secondary">Template</button>
+                                </a>
 
-    <input type="file" id="minReceiveFile" accept=".csv,.xlsx" style="margin-top:10px;" />
+                                <input type="file" id="minReceiveFile" accept=".csv,.xlsx" />
 
-    <button class="btn btn-primary" style="margin-top:10px;" onclick="uploadMinReceive()">
-        Enviar
-    </button>
+                                <button class="btn btn-primary" onclick="uploadMinReceive()">
+                                    Enviar
+                                </button>
+                            </div>
 
-    <div class="muted" id="minReceiveInfo" style="margin-top:8px;"></div>
-</div>
+                            <div class="muted" id="minReceiveInfo" style="margin-top:8px;"></div>
+                        </div>
 
                         <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
