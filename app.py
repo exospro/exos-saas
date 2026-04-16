@@ -1173,8 +1173,8 @@ def build_inventory_cmd(connected_seller_id: int, limit_items: int) -> list[str]
         "--connected-seller-id",
         str(connected_seller_id),
     ]
-    if limit_items and limit_items > 0:
-        cmd.extend(["--limit-items", str(limit_items)])
+    #if limit_items and limit_items > 0:
+    #    cmd.extend(["--limit-items", str(limit_items)])
     return cmd
 
 
