@@ -1,14 +1,16 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
 import os
 import re
 import time
 import subprocess
+import csv
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, quote
 import secrets
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import Json, RealDictCursor, execute_values
 
 import requests
 
@@ -43,6 +45,11 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
+
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
 
 
 
@@ -357,6 +364,125 @@ def register_daily_execution(account_id: int) -> dict:
         conn.commit()
     return dict(row)
 
+
+
+def ensure_account_sku_min_receive_table() -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE SCHEMA IF NOT EXISTS app;
+                CREATE TABLE IF NOT EXISTS app.account_sku_min_receive (
+                    id BIGSERIAL PRIMARY KEY,
+                    account_id BIGINT NOT NULL,
+                    sku TEXT NOT NULL,
+                    vlr_min_receber NUMERIC(18,2) NOT NULL,
+                    source_file_name TEXT,
+                    uploaded_by_user_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (account_id, sku)
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_sku_min_receive_account
+                ON app.account_sku_min_receive (account_id);
+                """
+            )
+        conn.commit()
+
+
+def parse_decimal_br(value) -> float:
+    text = str(value or '').strip()
+    if not text:
+        raise ValueError('Valor vazio')
+    if ',' in text:
+        text = text.replace('.', '').replace(',', '.')
+    return float(text)
+
+
+def parse_min_receive_file(filename: str, content: bytes) -> list[tuple[str, float]]:
+    name = (filename or '').lower()
+    rows: list[tuple[str, float]] = []
+
+    if name.endswith('.csv'):
+        decoded = content.decode('utf-8-sig')
+        sample = decoded[:4096]
+        delim = ';' if sample.count(';') >= sample.count(',') else ','
+        reader = csv.DictReader(decoded.splitlines(), delimiter=delim)
+        fields = {str(f).strip().lower(): f for f in (reader.fieldnames or [])}
+        if 'sku' not in fields or 'vlr_min_receber' not in fields:
+            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
+        for row in reader:
+            sku = str(row.get(fields['sku']) or '').strip()
+            if not sku:
+                continue
+            rows.append((sku, parse_decimal_br(row.get(fields['vlr_min_receber']))))
+        return rows
+
+    if name.endswith('.xlsx'):
+        if openpyxl is None:
+            raise HTTPException(status_code=500, detail='Suporte a XLSX não disponível. Adicione openpyxl ao requirements.txt.')
+        wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
+        ws = wb.active
+        header = [str(c.value or '').strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        if 'sku' not in header or 'vlr_min_receber' not in header:
+            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
+        idx_sku = header.index('sku')
+        idx_val = header.index('vlr_min_receber')
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            sku = str(row[idx_sku] or '').strip()
+            if not sku:
+                continue
+            rows.append((sku, parse_decimal_br(row[idx_val])))
+        return rows
+
+    raise HTTPException(status_code=400, detail='Formato inválido. Envie um arquivo .csv ou .xlsx.')
+
+
+def replace_account_min_receive(account_id: int, uploaded_by_user_id: int, filename: str, rows: list[tuple[str, float]]) -> int:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
+            if rows:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO app.account_sku_min_receive (
+                        account_id, sku, vlr_min_receber, source_file_name, uploaded_by_user_id, created_at, updated_at
+                    ) VALUES %s
+                    """,
+                    [(account_id, sku, value, filename, uploaded_by_user_id) for sku, value in rows],
+                    template='(%s,%s,%s,%s,%s,now(),now())',
+                    page_size=500,
+                )
+        conn.commit()
+    return len(rows)
+
+
+def list_account_min_receive(account_id: int, limit: int = 50) -> list[dict]:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT sku, vlr_min_receber, source_file_name, updated_at
+                FROM app.account_sku_min_receive
+                WHERE account_id = %s
+                ORDER BY updated_at DESC, sku
+                LIMIT %s
+                """,
+                (account_id, limit),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_account_min_receive(account_id: int) -> int:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
+            return int(cur.fetchone()[0] or 0)
 
 
 def get_session_user(request: Request) -> dict | None:
@@ -734,10 +860,6 @@ def render_login_page(error_message: str = "") -> str:
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
 </style>
     </head>
     <body>
@@ -820,10 +942,6 @@ def onboarding_page(request: Request):
           color: #64748b;
         }}
       
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
 </style>
     </head>
     <body>
@@ -1417,6 +1535,32 @@ def badge(status: str | None) -> str:
 def root(request: Request):
     user = get_session_user(request)
     return RedirectResponse(url="/painel" if user else "/login")
+
+
+@app.get("/template/sku-min-receber.csv")
+def download_template_min_receive_csv(request: Request):
+    require_user(request)
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
+    return PlainTextResponse("sku;vlr_min_receber\nSKU-EXEMPLO-1;120,00\nSKU-EXEMPLO-2;95,50\n", media_type="text/csv", headers=headers)
+
+
+@app.get("/account/min-receive")
+def account_min_receive_list(request: Request, account_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
+    return {"count": count_account_min_receive(account_id), "rows": list_account_min_receive(account_id, 50)}
+
+
+@app.post("/account/min-receive/upload")
+async def account_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin"))
+    content = await file.read()
+    rows = parse_min_receive_file(file.filename or '', content)
+    if not rows:
+        raise HTTPException(status_code=400, detail='Nenhum registro válido encontrado no arquivo.')
+    saved = replace_account_min_receive(account_id, int(user['id']), file.filename or 'upload', rows)
+    return {"ok": True, "rows_saved": saved}
 
 
 @app.get("/health")
@@ -2216,6 +2360,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-item {{ padding: 10px 12px; border-radius: 12px; background: rgba(2,8,23,0.55); margin-bottom: 8px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center; }}
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
+            .card.compact {{ padding: 18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
             @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
             .card.compact {{padding: 16px;min-height: unset;}}
@@ -2257,30 +2402,12 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div id="recentJobs">Carregando...</div>
                     </div>
                 </div>
+                <div style="display:flex; flex-direction:column; gap:20px;">
                 <div class="card">
                     <h2>Executar otimização</h2>
                     <div class="form-row">
                         <label>Conta ativa</label>
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
-<div class="card compact">
-    <h2>SKU mínimo</h2>
-    <div class="muted">Upload SKU x valor mínimo</div>
-
-    <div style="margin-top:10px;">
-        <a href="/template/sku-min-receber.csv" target="_blank">
-            <button class="btn btn-secondary">Template</button>
-        </a>
-    </div>
-
-    <input type="file" id="minReceiveFile" accept=".csv,.xlsx" style="margin-top:10px;" />
-
-    <button class="btn btn-primary" style="margin-top:10px;" onclick="uploadMinReceive()">
-        Enviar
-    </button>
-
-    <div class="muted" id="minReceiveInfo" style="margin-top:8px;"></div>
-</div>
-
                         <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
                     </div>
@@ -2313,6 +2440,26 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="metric"><div class="metric-label">Erros/Falhas</div><div class="metric-value" id="mErrors">-</div></div>
                         </div>
                     </div>
+                </div>
+                <div class="card">
+                    <h2>SKU mínimo a receber</h2>
+                    <div class="muted">Baixe o template, preencha <strong>sku</strong> e <strong>vlr_min_receber</strong> e envie o arquivo.</div>
+                    <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                    <div class="actions" style="margin-top:14px;">
+                        <a class="button-link" href="/template/sku-min-receber.csv" target="_blank"><button class="btn btn-secondary" type="button">Baixar template CSV</button></a>
+                    </div>
+                    <div class="invite-row" style="margin-top:14px;">
+                        <div>
+                            <label for="minReceiveFile">Arquivo CSV ou XLSX</label>
+                            <input type="file" id="minReceiveFile" accept=".csv,.xlsx" />
+                        </div>
+                        <div>
+                            <button class="btn btn-primary" style="width:auto; height:40px; padding:0 18px; font-size:14px;" onclick="uploadMinReceive()">Enviar arquivo</button>
+                        </div>
+                    </div>
+                    <div class="muted" id="minReceiveInfo" style="margin-top:12px;">Nenhum arquivo enviado nesta sessão.</div>
+                    <div class="invite-list" id="minReceiveList">Carregando tabela...</div>
+                </div>
                 </div>
             </div>
             <div class="card" style="margin-top:20px;">
@@ -2582,6 +2729,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             toggleLimitInput();
             refreshRecentJobs();
             refreshInvites();
+            refreshMinReceive();
         </script>
     </body>
     </html>
