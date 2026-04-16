@@ -2556,3 +2556,36 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     </body>
     </html>
     """
+
+# =========================
+# MLB STATS (PAINEL)
+# =========================
+from psycopg2.extras import RealDictCursor
+
+def get_connected_seller_mlb_stats(connected_seller_id: int) -> dict:
+    sql = """
+    WITH last_run AS (
+        SELECT max(run_id) AS run_id
+        FROM ml.inventory_snapshot_item
+        WHERE connected_seller_id = %s
+    )
+    SELECT
+        count(DISTINCT mlb) AS total_mlbs,
+        count(DISTINCT CASE WHEN status = 'active' THEN mlb END) AS active_mlbs,
+        count(DISTINCT CASE WHEN status = 'paused' THEN mlb END) AS paused_mlbs
+    FROM ml.inventory_snapshot_item i
+    JOIN last_run r
+      ON i.run_id = r.run_id
+    WHERE i.connected_seller_id = %s
+    """
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (connected_seller_id, connected_seller_id))
+            row = cur.fetchone() or {}
+
+    return {
+        "total_mlbs": int(row.get("total_mlbs") or 0),
+        "active_mlbs": int(row.get("active_mlbs") or 0),
+        "paused_mlbs": int(row.get("paused_mlbs") or 0),
+    }
