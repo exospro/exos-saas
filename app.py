@@ -1043,7 +1043,18 @@ def get_connected_seller_mlb_stats_live(connected_seller_id: int, cache_minutes:
     ensure_connected_seller_stats_cache_table()
 
     seller = get_connected_seller_summary(connected_seller_id)
-    mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
+    try:
+        mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
+    except Exception as e:
+        print("ERRO ML STATS:", e)
+        mlb_stats = {
+            "total_mlbs": 0,
+            "active_mlbs": 0,
+            "paused_mlbs": 0,
+            "source": "error",
+            "fetched_at": None,
+        }
+
     if not seller.get("connected") or not seller.get("ml_user_id"):
         return {
             "total_mlbs": 0,
@@ -2105,7 +2116,19 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     else:
         require_connected_seller_access(int(user["id"]), connected_seller_id)
     seller = get_connected_seller_summary(connected_seller_id)
-    mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
+
+    try:
+        mlb_stats = get_connected_seller_mlb_stats_live(connected_seller_id)
+    except Exception as e:
+        print("ERRO ML STATS:", e)
+        mlb_stats = {
+            "total_mlbs": 0,
+            "active_mlbs": 0,
+            "paused_mlbs": 0,
+            "source": "fallback",
+            "fetched_at": None,
+        }
+
     current_account_id = int(seller.get("account_id") or accessible_sellers[0]["account_id"])
     current_user_role = get_user_role_for_account(int(user["id"]), current_account_id)
     can_manage_access = current_user_role in ("owner", "admin")
