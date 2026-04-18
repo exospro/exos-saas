@@ -15,7 +15,7 @@ import requests
 from etl.inventory.repository import db_connect
 
 app = FastAPI()
-#..
+#.
 
 ML_CLIENT_ID = os.environ["ML_CLIENT_ID"]
 ML_CLIENT_SECRET = os.environ["ML_CLIENT_SECRET"]
@@ -1425,31 +1425,6 @@ def get_latest_inventory_mlb_stats(connected_seller_id: int) -> dict:
     }
 
 
-def get_latest_inventory_unique_skus(connected_seller_id: int) -> list[str]:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH latest_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT DISTINCT trim(i.sku) AS sku
-                FROM ml.inventory_snapshot_item i
-                JOIN latest_run lr
-                  ON lr.run_id = i.run_id
-                WHERE i.connected_seller_id = %s
-                  AND i.sku IS NOT NULL
-                  AND trim(i.sku) <> ''
-                ORDER BY trim(i.sku)
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            rows = cur.fetchall()
-    return [str(r[0]) for r in rows if r and r[0]]
-
-
 def badge(status: str | None) -> str:
     status = (status or "").lower()
 
@@ -1743,14 +1718,24 @@ def auth_google_callback(request: Request):
 
 
 @app.get("/template/sku-min-receber.csv")
-def download_template_min_receive_csv(request: Request):
-    require_user(request)
+def download_template_min_receive_csv(request: Request, connected_seller_id: int):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
+
+    skus = get_latest_inventory_unique_skus(connected_seller_id)
+    if not skus:
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum SKU encontrado na última execução do inventory para esta conta."
+        )
+
+    lines = ["SKU;$_CLASSICO;$_PREMIUM"]
+    for sku in skus:
+        lines.append(f"{sku};;")
+
+    content = "\n".join(lines) + "\n"
     headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
-    return PlainTextResponse(
-        "sku;vlr_min_receber\\nSKU-EXEMPLO-1;120,00\\nSKU-EXEMPLO-2;95,50\\n",
-        media_type="text/csv",
-        headers=headers,
-    )
+    return PlainTextResponse(content, media_type="text/csv", headers=headers)
 
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
@@ -2093,8 +2078,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
     inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
     mlb_stats = get_latest_inventory_mlb_stats(connected_seller_id)
-    latest_inventory_skus = get_latest_inventory_unique_skus(connected_seller_id)
-    can_download_min_receive_template = len(latest_inventory_skus) > 0
     inventory_plan_warning = ""
 
     if subscription:
