@@ -1726,16 +1726,19 @@ def download_template_min_receive_csv(request: Request, connected_seller_id: int
     if not skus:
         raise HTTPException(
             status_code=404,
-            detail="Nenhum SKU encontrado na última execução do inventory para esta conta."
+            detail="Nenhum SKU encontrado na última execução do inventory para esta conta.",
         )
 
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
     lines = ["SKU;$_CLASSICO;$_PREMIUM"]
     for sku in skus:
         lines.append(f"{sku};;")
 
-    content = "\n".join(lines) + "\n"
-    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
-    return PlainTextResponse(content, media_type="text/csv", headers=headers)
+    return PlainTextResponse(
+        "\n".join(lines) + "\n",
+        media_type="text/csv",
+        headers=headers,
+    )
 
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
@@ -2372,13 +2375,11 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="sku-header">
                                 <h2>SKU mínimo</h2>
 
-                                {f"""
-                                <a href="/template/sku-min-receber.csv?connected_seller_id={connected_seller_id}" target="_blank" class="button-link">
+                                <a href="/template/sku-min-receber.csv" target="_blank" class="button-link">
                                     <button class="btn btn-secondary btn-small" type="button">
                                         Baixar template
                                     </button>
                                 </a>
-                                """ if can_download_min_receive_template else ""}
                             </div>
 
                             <div class="muted">Upload de SKU x valor mínimo a receber</div>
