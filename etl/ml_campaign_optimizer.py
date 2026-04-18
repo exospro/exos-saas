@@ -32,6 +32,8 @@ DEFAULT_MAX_MELI_REBATE_PCT = float(os.environ.get("ML_CAMPAIGN_OPT_MAX_MELI_REB
 DEFAULT_FLUSH_EVERY = int(os.environ.get("ML_CAMPAIGN_OPT_FLUSH_EVERY", "500"))
 DEFAULT_USE_COST = os.environ.get("ML_CAMPAIGN_OPT_USE_COST", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
 DEFAULT_INSERT_PAGE_SIZE = int(os.environ.get("ML_CAMPAIGN_OPT_INSERT_PAGE_SIZE", "1000"))
+SITE_ID = os.environ.get("ML_SITE_ID", "MLB")
+SHIP_ZIP = os.environ.get("ML_SHIP_ZIP", "04111080")
 
 LOG_TABLE_DDL = """
 CREATE SCHEMA IF NOT EXISTS ml;
@@ -96,6 +98,7 @@ class ScopeItem:
     title: str | None
     status: str | None
     listing_type_id: str | None
+    category_id: str | None
     price: Decimal | None
     effective_price: Decimal | None
     fee_amount_effective: Decimal | None
@@ -334,6 +337,7 @@ def fetch_scope_rows(conn, connected_seller_id: int, source_run_id: int | None =
             i.title,
             i.status,
             i.listing_type_id,
+            i.category_id,
             i.price,
             i.effective_price,
             i.fee_amount_effective,
@@ -452,34 +456,6 @@ def fetch_join_key_to_cost(conn) -> dict[str, Decimal]:
     return out
 
 
-
-
-def fetch_sku_min_receive_map(conn, connected_seller_id: int) -> dict[str, dict[str, Decimal | None]]:
-    sql = """
-    SELECT
-        smr.sku,
-        smr.min_receive_classico,
-        smr.min_receive_premium
-    FROM app.account_sku_min_receive smr
-    JOIN ml.connected_seller cs
-      ON cs.account_id = smr.account_id
-    WHERE cs.id = %s
-    """
-
-    out: dict[str, dict[str, Decimal | None]] = {}
-    with conn.cursor() as cur:
-        cur.execute(sql, (connected_seller_id,))
-        for sku, min_receive_classico, min_receive_premium in cur.fetchall():
-            sku_key = str(sku or "").strip()
-            if not sku_key:
-                continue
-            out[sku_key] = {
-                "min_receive_classico": to_decimal(min_receive_classico),
-                "min_receive_premium": to_decimal(min_receive_premium),
-            }
-    return out
-
-
 def build_scope_items(conn, connected_seller_id: int, source_run_id: int | None = None, limit: int | None = None) -> list[ScopeItem]:
     rows = fetch_scope_rows(conn, connected_seller_id=connected_seller_id, source_run_id=source_run_id, limit=limit)
     if not rows:
@@ -525,6 +501,7 @@ def build_scope_items(conn, connected_seller_id: int, source_run_id: int | None 
                 title=row.get("title"),
                 status=row.get("status"),
                 listing_type_id=row.get("listing_type_id"),
+                category_id=row.get("category_id"),
                 price=to_decimal(row.get("price")),
                 effective_price=to_decimal(row.get("effective_price")),
                 fee_amount_effective=to_decimal(row.get("fee_amount_effective")),
@@ -571,6 +548,113 @@ def item_promotions(
     if resp.status_code == 404:
         return []
     raise requests.HTTPError(f"{resp.status_code} {resp.reason} - {_safe_json(resp)}")
+
+
+def fetch_listing_fee(
+    session: requests.Session,
+    price: Decimal | None,
+    category_id: str | None,
+    listing_type_id: str | None,
+    *,
+    auth_headers: dict[str, str],
+) -> dict:
+    if price is None or price <= 0 or not category_id or not listing_type_id:
+        return {"fee_amount": None, "fee_pct": None}
+
+    params = {
+        "price": float(q2(price)),
+        "category_id": category_id,
+        "listing_type_id": listing_type_id,
+    }
+    resp = session.get(
+        f"https://api.mercadolibre.com/sites/{SITE_ID}/listing_prices",
+        headers=auth_headers,
+        params=params,
+        timeout=DEFAULT_TIMEOUT,
+        verify=session.verify,
+    )
+    if not (200 <= resp.status_code < 300):
+        raise requests.HTTPError(f"{resp.status_code} {resp.reason} - {_safe_json(resp)}")
+
+    data = _safe_json(resp)
+    fee_amount = to_decimal(data.get("sale_fee_amount"))
+    fee_pct = None
+    if fee_amount is not None and price > 0:
+        fee_pct = q6(fee_amount / price)
+    return {"fee_amount": q2(fee_amount), "fee_pct": fee_pct}
+
+
+def pick_shipping_option(shipping_options: dict) -> dict:
+    options = shipping_options.get("options") or []
+    if not options:
+        return {}
+
+    for opt in options:
+        if (opt.get("shipping_method_type") or "").lower() == "fulfillment":
+            return opt
+
+    def opt_key(opt: dict):
+        lc = opt.get("list_cost")
+        c = opt.get("cost")
+        return (
+            lc if isinstance(lc, (int, float)) else float("inf"),
+            c if isinstance(c, (int, float)) else float("inf"),
+        )
+
+    return sorted(options, key=opt_key)[0]
+
+
+def fetch_shipping_option(
+    session: requests.Session,
+    item_id: str,
+    *,
+    auth_headers: dict[str, str],
+) -> dict:
+    if not item_id:
+        return {"shipping_list_cost": None, "shipping_method_id": None, "shipping_method_type": None}
+
+    params = {"zip_code": SHIP_ZIP, "quantity": 1}
+    resp = session.get(
+        f"https://api.mercadolibre.com/items/{item_id}/shipping_options",
+        headers=auth_headers,
+        params=params,
+        timeout=DEFAULT_TIMEOUT,
+        verify=session.verify,
+    )
+    if not (200 <= resp.status_code < 300):
+        raise requests.HTTPError(f"{resp.status_code} {resp.reason} - {_safe_json(resp)}")
+
+    data = _safe_json(resp)
+    chosen = pick_shipping_option(data)
+    return {
+        "shipping_list_cost": to_decimal(chosen.get("list_cost")),
+        "shipping_method_id": chosen.get("shipping_method_id"),
+        "shipping_method_type": chosen.get("shipping_method_type"),
+    }
+
+
+def fetch_sku_min_receive_map(conn, connected_seller_id: int) -> dict[str, dict[str, Decimal | None]]:
+    sql = """
+    SELECT
+        smr.sku,
+        smr.min_receive_classico,
+        smr.min_receive_premium
+    FROM app.account_sku_min_receive smr
+    JOIN ml.connected_seller cs
+      ON cs.account_id = smr.account_id
+    WHERE cs.id = %s
+    """
+    out: dict[str, dict[str, Decimal | None]] = {}
+    with conn.cursor() as cur:
+        cur.execute(sql, (connected_seller_id,))
+        for sku, min_classico, min_premium in cur.fetchall():
+            if sku in (None, ""):
+                continue
+            out[str(sku).strip()] = {
+                "min_receive_classico": to_decimal(min_classico),
+                "min_receive_premium": to_decimal(min_premium),
+            }
+    return out
 
 
 def _extract_error_code(err: dict) -> str | None:
@@ -747,21 +831,24 @@ def normalize_candidate_promotion(item: ScopeItem, promo: dict, today_utc: datet
             return None
 
     meli_percent = extract_percent(promo, ["meli_percent", "meli_percentage", "marketplace_percent", "meli_contribution_percent"])
-    if meli_percent is None or meli_percent <= 0:
-        return None
-    if max_meli_rebate_pct > 0 and meli_percent > max_meli_rebate_pct:
+    if meli_percent is not None and max_meli_rebate_pct > 0 and meli_percent > max_meli_rebate_pct:
         return None
 
     seller_percent = extract_percent(promo, ["seller_percent", "seller_percentage", "seller_contribution_percent"])
-    deal_price = to_decimal(first_non_empty(promo, ["price", "deal_price", "price_to_show", "offer_price"]))
+    deal_price = to_decimal(first_non_empty(
+        promo,
+        ["price", "deal_price", "price_to_show", "offer_price", "max_discounted_price", "suggested_discounted_price"],
+    ))
     if deal_price is None or deal_price <= 0:
         return None
 
-    rebate_meli_amount = q2(deal_price * meli_percent)
-    if rebate_meli_amount is None:
-        return None
-    if max_meli_rebate_pct > 0 and rebate_meli_amount > q2(deal_price * max_meli_rebate_pct):
-        return None
+    rebate_meli_amount = Decimal("0")
+    if meli_percent is not None and meli_percent > 0:
+        rebate_meli_amount = q2(deal_price * meli_percent)
+        if rebate_meli_amount is None:
+            return None
+        if max_meli_rebate_pct > 0 and rebate_meli_amount > q2(deal_price * max_meli_rebate_pct):
+            return None
 
     fin = calculate_financials(
         price=deal_price,
@@ -804,7 +891,11 @@ def normalize_candidate_promotion(item: ScopeItem, promo: dict, today_utc: datet
 
 def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_pct: Decimal,
                           min_margin_pct: Decimal, max_meli_rebate_pct: Decimal, use_cost: bool,
-                          sku_min_receive_map: dict[str, dict[str, Decimal | None]] | None = None) -> tuple[dict, str]:
+                          sku_min_receive_map: dict[str, dict[str, Decimal | None]] | None = None,
+                          fee_cache: dict | None = None,
+                          shipping_cache: dict | None = None,
+                          session: requests.Session | None = None,
+                          auth_headers: dict[str, str] | None = None) -> tuple[dict, str]:
     current_price = current_price_for_comparison(item)
     if current_price is None or current_price <= 0:
         return {}, "current_price_missing"
@@ -835,6 +926,9 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
     current_net_result = calculate_net_result(current_fin)
     if current_net_result is None:
         return {}, "current_net_result_missing"
+
+    fee_cache = fee_cache if fee_cache is not None else {}
+    shipping_cache = shipping_cache if shipping_cache is not None else {}
 
     today_utc = datetime.now(timezone.utc)
     candidates: list[dict] = []
@@ -871,23 +965,58 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
             if new_margin < min_margin_pct:
                 continue
         else:
+            sku_rule_applied = False
             sku_rule_passed = False
+            candidate_receive_estimated = None
+            sku_min_value = None
 
             if item.sku and sku_min_receive_map:
                 sku_limits = sku_min_receive_map.get(item.sku.strip())
                 if sku_limits:
-                    listing_type = str(item.listing_type_id or "").strip().lower()
-                    sku_min_value = None
-
+                    listing_type = (item.listing_type_id or "").strip().lower()
                     if listing_type == "gold_special":
                         sku_min_value = sku_limits.get("min_receive_classico")
                     elif listing_type == "gold_pro":
                         sku_min_value = sku_limits.get("min_receive_premium")
 
-                    if sku_min_value is not None and candidate_net_result >= sku_min_value:
-                        sku_rule_passed = True
+                    if sku_min_value is not None:
+                        sku_rule_applied = True
+                        if session is None or auth_headers is None:
+                            raise RuntimeError("session/auth_headers required for sku minimum rule")
 
-            if not sku_rule_passed:
+                        fee_key = (item.category_id or "", item.listing_type_id or "", str(q2(new_price)))
+                        if fee_key not in fee_cache:
+                            fee_cache[fee_key] = fetch_listing_fee(
+                                session,
+                                new_price,
+                                item.category_id,
+                                item.listing_type_id,
+                                auth_headers=auth_headers,
+                            )
+                        fee_info = fee_cache[fee_key]
+                        fee_amount_candidate = to_decimal(fee_info.get("fee_amount")) or Decimal("0")
+
+                        ship_key = item.mlb
+                        if ship_key not in shipping_cache:
+                            shipping_cache[ship_key] = fetch_shipping_option(
+                                session,
+                                item.mlb,
+                                auth_headers=auth_headers,
+                            )
+                        ship_info = shipping_cache[ship_key]
+                        shipping_cost_candidate = to_decimal(ship_info.get("shipping_list_cost")) or Decimal("0")
+
+                        candidate_receive_estimated = q2(new_price - fee_amount_candidate - shipping_cost_candidate)
+
+                        if candidate_receive_estimated is not None and candidate_receive_estimated >= sku_min_value:
+                            sku_rule_passed = True
+
+            if sku_rule_applied:
+                cand["candidate_receive_estimated"] = candidate_receive_estimated
+                cand["sku_min_value_used"] = sku_min_value
+                if not sku_rule_passed:
+                    continue
+            else:
                 if candidate_net_result < current_net_result:
                     continue
 
@@ -1063,7 +1192,6 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
         "raw_current": {
             "current_promotion_id": item.current_promotion_id,
             "current_promotion_type": item.current_promotion_type,
-            "listing_type_id": item.listing_type_id,
             "sale_amount_current": str(item.sale_amount_current) if item.sale_amount_current is not None else None,
             "effective_price": str(item.effective_price) if item.effective_price is not None else None,
             "price": str(item.price) if item.price is not None else None,
@@ -1083,6 +1211,9 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
             "candidate_ref_id": candidate.get("ref_id"),
             "current_net_result": str(decision.get("current_net_result")) if decision.get("current_net_result") is not None else None,
             "candidate_net_result": str(decision.get("candidate_net_result")) if decision.get("candidate_net_result") is not None else None,
+            "candidate_receive_estimated": str(candidate.get("candidate_receive_estimated")) if candidate.get("candidate_receive_estimated") is not None else None,
+            "sku_min_value_used": str(candidate.get("sku_min_value_used")) if candidate.get("sku_min_value_used") is not None else None,
+            "listing_type_id": item.listing_type_id,
             "use_cost": use_cost,
         },
         "raw_api_result": api_result,
@@ -1097,6 +1228,8 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
     session = _mk_session(insecure=insecure)
     limiter = RateLimiter(rps)
     auth_headers = build_auth_headers(connected_seller_id)
+    fee_cache: dict = {}
+    shipping_cache: dict = {}
 
     if mlb_filter:
         items = [item for item in items if item.mlb in mlb_filter]
@@ -1161,6 +1294,10 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 max_meli_rebate_pct=max_meli_rebate_pct,
                 use_cost=use_cost,
                 sku_min_receive_map=sku_min_receive_map,
+                fee_cache=fee_cache,
+                shipping_cache=shipping_cache,
+                session=session,
+                auth_headers=auth_headers,
             )
             decision["tax_pct"] = tax_pct
             decision["max_meli_rebate_pct"] = max_meli_rebate_pct
