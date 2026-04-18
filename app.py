@@ -820,10 +820,10 @@ def onboarding_page(request: Request):
           color: #64748b;
         }}
       
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
+        .card.compact {{
+            padding: 16px;
+            min-height: unset;
+        }}
 </style>
     </head>
     <body>
