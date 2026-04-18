@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
 import os
+import csv
+import io
 import re
 import time
 import subprocess
@@ -11,6 +13,7 @@ import secrets
 from psycopg2.extras import Json, RealDictCursor
 
 import requests
+import openpyxl
 
 from etl.inventory.repository import db_connect
 
@@ -357,6 +360,203 @@ def register_daily_execution(account_id: int) -> dict:
         conn.commit()
     return dict(row)
 
+
+
+
+def ensure_account_sku_min_receive_table() -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE SCHEMA IF NOT EXISTS app;
+                CREATE TABLE IF NOT EXISTS app.account_sku_min_receive (
+                    account_id BIGINT NOT NULL,
+                    sku TEXT NOT NULL,
+                    min_receive_classico NUMERIC(18,2),
+                    min_receive_premium NUMERIC(18,2),
+                    source_file_name TEXT,
+                    uploaded_by_user_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (account_id, sku)
+                );
+                CREATE INDEX IF NOT EXISTS ix_account_sku_min_receive_account_id
+                ON app.account_sku_min_receive (account_id);
+                CREATE INDEX IF NOT EXISTS ix_account_sku_min_receive_sku
+                ON app.account_sku_min_receive (sku);
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE app.account_sku_min_receive
+                    ADD COLUMN IF NOT EXISTS min_receive_classico NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS min_receive_premium NUMERIC(18,2),
+                    ADD COLUMN IF NOT EXISTS source_file_name TEXT,
+                    ADD COLUMN IF NOT EXISTS uploaded_by_user_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                """
+            )
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'app'
+                          AND table_name = 'account_sku_min_receive'
+                          AND column_name = 'vlr_min_receber'
+                    ) THEN
+                        UPDATE app.account_sku_min_receive
+                        SET
+                            min_receive_classico = COALESCE(min_receive_classico, vlr_min_receber),
+                            min_receive_premium = COALESCE(min_receive_premium, vlr_min_receber)
+                        WHERE vlr_min_receber IS NOT NULL;
+                    END IF;
+                END $$;
+                """
+            )
+        conn.commit()
+
+
+def parse_decimal_nullable(value) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace("R$", "").replace("$", "").strip()
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    return round(float(text), 2)
+
+
+def parse_min_receive_file_v2(filename: str, content: bytes) -> list[tuple[str, float | None, float | None]]:
+    name = (filename or "").lower()
+    rows: list[tuple[str, float | None, float | None]] = []
+
+    def normalize_header_map(fieldnames: list[str] | None) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for raw in fieldnames or []:
+            if raw is None:
+                continue
+            original = str(raw)
+            key = original.strip().lower()
+            out[key] = original
+        return out
+
+    def required_indexes(fields: dict[str, str]) -> tuple[str, str, str]:
+        sku_col = fields.get("sku")
+        classico_col = fields.get("$_classico") or fields.get("min_receive_classico") or fields.get("vlr_classico")
+        premium_col = fields.get("$_premium") or fields.get("min_receive_premium") or fields.get("vlr_premium")
+        if not sku_col or not classico_col or not premium_col:
+            raise HTTPException(
+                status_code=400,
+                detail="O arquivo deve conter as colunas SKU, $_CLASSICO e $_PREMIUM."
+            )
+        return sku_col, classico_col, premium_col
+
+    if name.endswith(".csv"):
+        decoded = content.decode("utf-8-sig")
+        sample = decoded[:4096]
+        delim = ";" if sample.count(";") >= sample.count(",") else ","
+        reader = csv.DictReader(decoded.splitlines(), delimiter=delim)
+        fields = normalize_header_map(reader.fieldnames)
+        sku_col, classico_col, premium_col = required_indexes(fields)
+        latest_by_sku: dict[str, tuple[float | None, float | None]] = {}
+        for row in reader:
+            sku = str(row.get(sku_col) or "").strip()
+            if not sku:
+                continue
+            latest_by_sku[sku] = (
+                parse_decimal_nullable(row.get(classico_col)),
+                parse_decimal_nullable(row.get(premium_col)),
+            )
+        return [(sku, vals[0], vals[1]) for sku, vals in sorted(latest_by_sku.items())]
+
+    if name.endswith(".xlsx"):
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        ws = wb.active
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        fields = normalize_header_map([str(v or "") for v in (header_row or [])])
+        sku_col, classico_col, premium_col = required_indexes(fields)
+        headers = [str(v or "") for v in (header_row or [])]
+        idx_sku = headers.index(sku_col)
+        idx_classico = headers.index(classico_col)
+        idx_premium = headers.index(premium_col)
+        latest_by_sku: dict[str, tuple[float | None, float | None]] = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            sku = str(row[idx_sku] or "").strip()
+            if not sku:
+                continue
+            latest_by_sku[sku] = (
+                parse_decimal_nullable(row[idx_classico]),
+                parse_decimal_nullable(row[idx_premium]),
+            )
+        return [(sku, vals[0], vals[1]) for sku, vals in sorted(latest_by_sku.items())]
+
+    raise HTTPException(status_code=400, detail="Formato inválido. Envie um arquivo .csv ou .xlsx.")
+
+
+def replace_account_min_receive_v2(
+    account_id: int,
+    uploaded_by_user_id: int,
+    filename: str,
+    rows: list[tuple[str, float | None, float | None]],
+) -> int:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
+            for sku, val_classico, val_premium in rows:
+                cur.execute(
+                    """
+                    INSERT INTO app.account_sku_min_receive (
+                        account_id,
+                        sku,
+                        min_receive_classico,
+                        min_receive_premium,
+                        source_file_name,
+                        uploaded_by_user_id,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                    """,
+                    (account_id, sku, val_classico, val_premium, filename, uploaded_by_user_id),
+                )
+        conn.commit()
+    return len(rows)
+
+
+def list_account_min_receive(account_id: int, limit: int = 50) -> list[dict]:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    sku,
+                    min_receive_classico,
+                    min_receive_premium,
+                    source_file_name,
+                    updated_at
+                FROM app.account_sku_min_receive
+                WHERE account_id = %s
+                ORDER BY updated_at DESC, sku
+                LIMIT %s
+                """,
+                (account_id, limit),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_account_min_receive(account_id: int) -> int:
+    ensure_account_sku_min_receive_table()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
+            return int(cur.fetchone()[0] or 0)
 
 
 def get_session_user(request: Request) -> dict | None:
@@ -1768,6 +1968,26 @@ def download_template_min_receive_csv(request: Request, connected_seller_id: int
         },
     )
 
+
+@app.get("/account/min-receive")
+def account_min_receive_list(request: Request, account_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
+    return {"count": count_account_min_receive(account_id), "rows": list_account_min_receive(account_id, 50)}
+
+
+@app.post("/account/min-receive/upload")
+async def account_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin"))
+    content = await file.read()
+    rows = parse_min_receive_file_v2(file.filename or "", content)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Nenhum registro válido encontrado no arquivo.")
+    saved = replace_account_min_receive_v2(account_id, int(user["id"]), file.filename or "upload", rows)
+    return {"ok": True, "rows_saved": saved}
+
+
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
     user = require_user(request)
@@ -2717,6 +2937,49 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 }} catch (err) {{
                     setOutput(String(err));
                     await refreshRecentJobs();
+                }}
+            }}
+
+
+            async function uploadMinReceive() {{
+                const fileInput = document.getElementById("minReceiveFile");
+                const info = document.getElementById("minReceiveInfo");
+                const accountId = document.getElementById("currentAccountId")?.value;
+
+                if (!fileInput || !fileInput.files || !fileInput.files.length) {{
+                    alert("Selecione um arquivo CSV ou XLSX.");
+                    return;
+                }}
+                if (!accountId) {{
+                    alert("account_id não encontrado na tela.");
+                    return;
+                }}
+
+                const formData = new FormData();
+                formData.append("file", fileInput.files[0]);
+
+                info.innerText = "Enviando arquivo...";
+                try {{
+                    const res = await fetch(`/account/min-receive/upload?account_id=${{encodeURIComponent(accountId)}}`, {{
+                        method: "POST",
+                        body: formData
+                    }});
+                    const text = await res.text();
+                    let data = null;
+                    try {{
+                        data = JSON.parse(text);
+                    }} catch (e) {{
+                        if (!res.ok) throw new Error(text);
+                        throw e;
+                    }}
+                    if (!res.ok) {{
+                        const detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || data);
+                        throw new Error(detail);
+                    }}
+                    info.innerText = `Arquivo enviado com sucesso. ${{data.rows_saved || 0}} SKU(s) salvos.`;
+                    fileInput.value = "";
+                }} catch (e) {{
+                    info.innerText = `Erro no upload: ${{String(e)}}`;
                 }}
             }}
 
