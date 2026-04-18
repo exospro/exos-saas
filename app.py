@@ -745,10 +745,10 @@ def render_login_page(error_message: str = "") -> str:
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
+            .card.compact {{
+                padding: 16px;
+                min-height: unset;
+            }}
 </style>
     </head>
     <body>
