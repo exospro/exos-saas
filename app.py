@@ -734,10 +734,10 @@ def render_login_page(error_message: str = "") -> str:
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         
-.card.compact {
+.card.compact {{
     padding: 16px;
     min-height: unset;
-}
+}}
 </style>
     </head>
     <body>
@@ -1729,13 +1729,14 @@ def download_template_min_receive_csv(request: Request, connected_seller_id: int
             detail="Nenhum SKU encontrado na última execução do inventory para esta conta.",
         )
 
-    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
     lines = ["SKU;$_CLASSICO;$_PREMIUM"]
     for sku in skus:
         lines.append(f"{sku};;")
 
+    content = "\n".join(lines) + "\n"
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
     return PlainTextResponse(
-        "\n".join(lines) + "\n",
+        content,
         media_type="text/csv",
         headers=headers,
     )
@@ -2375,7 +2376,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="sku-header">
                                 <h2>SKU mínimo</h2>
 
-                                <a href="/template/sku-min-receber.csv" target="_blank" class="button-link">
+                                <a href="/template/sku-min-receber.csv?connected_seller_id={connected_seller_id}" target="_blank" class="button-link">
                                     <button class="btn btn-secondary btn-small" type="button">
                                         Baixar template
                                     </button>
