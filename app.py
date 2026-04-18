@@ -820,10 +820,10 @@ def onboarding_page(request: Request):
           color: #64748b;
         }}
       
-        .card.compact {{
-            padding: 16px;
-            min-height: unset;
-        }}
+.card.compact {
+    padding: 16px;
+    min-height: unset;
+}
 </style>
     </head>
     <body>
@@ -1425,6 +1425,32 @@ def get_latest_inventory_mlb_stats(connected_seller_id: int) -> dict:
     }
 
 
+
+
+def get_latest_inventory_unique_skus(connected_seller_id: int) -> list[str]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_run AS (
+                    SELECT max(run_id) AS run_id
+                    FROM ml.inventory_snapshot_item
+                    WHERE connected_seller_id = %s
+                )
+                SELECT DISTINCT trim(i.sku) AS sku
+                FROM ml.inventory_snapshot_item i
+                JOIN latest_run lr
+                  ON lr.run_id = i.run_id
+                WHERE i.connected_seller_id = %s
+                  AND i.sku IS NOT NULL
+                  AND trim(i.sku) <> ''
+                ORDER BY trim(i.sku)
+                """,
+                (connected_seller_id, connected_seller_id),
+            )
+            rows = cur.fetchall()
+    return [str(r[0]) for r in rows if r and r[0]]
+
 def badge(status: str | None) -> str:
     status = (status or "").lower()
 
@@ -1733,7 +1759,9 @@ def download_template_min_receive_csv(request: Request, connected_seller_id: int
     for sku in skus:
         lines.append(f"{sku};;")
 
-    content = "\n".join(lines) + "\n"
+    content = "
+".join(lines) + "
+"
     headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
     return PlainTextResponse(
         content,
@@ -2082,6 +2110,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
     inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
     mlb_stats = get_latest_inventory_mlb_stats(connected_seller_id)
+    latest_inventory_skus = get_latest_inventory_unique_skus(connected_seller_id)
+    can_download_min_receive_template = len(latest_inventory_skus) > 0
     inventory_plan_warning = ""
 
     if subscription:
@@ -2376,11 +2406,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="sku-header">
                                 <h2>SKU mínimo</h2>
 
-                                <a href="/template/sku-min-receber.csv?connected_seller_id={connected_seller_id}" target="_blank" class="button-link">
-                                    <button class="btn btn-secondary btn-small" type="button">
-                                        Baixar template
-                                    </button>
-                                </a>
+                                {"<a href=\"/template/sku-min-receber.csv?connected_seller_id=%s\" target=\"_blank\" class=\"button-link\">\n                                    <button class=\"btn btn-secondary btn-small\" type=\"button\">\n                                        Baixar template\n                                    </button>\n                                </a>" % connected_seller_id if can_download_min_receive_template else ""}
                             </div>
 
                             <div class="muted">Upload de SKU x valor mínimo a receber</div>
