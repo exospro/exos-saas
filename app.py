@@ -25,6 +25,7 @@ GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]
 APP_SESSION_COOKIE_NAME = os.environ.get("APP_SESSION_COOKIE_NAME", "exos_saas_session")
 APP_SESSION_DAYS = int(os.environ.get("APP_SESSION_DAYS", "30"))
+APP_ENV = os.environ.get("APP_ENV", "production").strip().lower()
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -43,6 +44,16 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
+
+
+def render_staging_banner() -> str:
+    if APP_ENV != "staging":
+        return ""
+    return """
+    <div style=\"background:#14532d;color:#ffffff;text-align:center;padding:8px 12px;font-weight:700;font-size:14px;letter-spacing:.3px;\">
+        🟢 AMBIENTE STAGING
+    </div>
+    """
 
 
 
@@ -741,6 +752,7 @@ def render_login_page(error_message: str = "") -> str:
 </style>
     </head>
     <body>
+        {render_staging_banner()}
         <div class="card">
             <h1>🚀 Exos Tools</h1>
             <p>Entre com sua conta Google para acessar sua área de otimização de campanhas do Mercado Livre.</p>
@@ -827,6 +839,7 @@ def onboarding_page(request: Request):
 </style>
     </head>
     <body>
+      {render_staging_banner()}
       <div class="box">
         <h1>🎉 Seu teste grátis <span class="gradient">começou</span></h1>
         <p>Você tem <b>10 dias</b> para testar o EXOS Profit e descobrir oportunidades reais de lucro no Mercado Livre.</p>
@@ -2317,6 +2330,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 </style>
     </head>
     <body>
+        {render_staging_banner()}
         <div class="container">
             <div class="topbar">
                 <div class="user-pill">Logado como: {user.get('email')}</div>
