@@ -25,7 +25,6 @@ GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]
 APP_SESSION_COOKIE_NAME = os.environ.get("APP_SESSION_COOKIE_NAME", "exos_saas_session")
 APP_SESSION_DAYS = int(os.environ.get("APP_SESSION_DAYS", "30"))
-APP_ENV = os.environ.get("APP_ENV", "production").strip().lower()
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -44,16 +43,6 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
-
-
-def render_staging_banner() -> str:
-    if APP_ENV != "staging":
-        return ""
-    return """
-    <div style=\"background:#14532d;color:#ffffff;text-align:center;padding:8px 12px;font-weight:700;font-size:14px;letter-spacing:.3px;\">
-        🟢 AMBIENTE STAGING
-    </div>
-    """
 
 
 
@@ -745,14 +734,13 @@ def render_login_page(error_message: str = "") -> str:
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         
-            .card.compact {{
-                padding: 16px;
-                min-height: unset;
-            }}
+.card.compact {
+    padding: 16px;
+    min-height: unset;
+}
 </style>
     </head>
     <body>
-        {render_staging_banner()}
         <div class="card">
             <h1>🚀 Exos Tools</h1>
             <p>Entre com sua conta Google para acessar sua área de otimização de campanhas do Mercado Livre.</p>
@@ -839,7 +827,6 @@ def onboarding_page(request: Request):
 </style>
     </head>
     <body>
-      {render_staging_banner()}
       <div class="box">
         <h1>🎉 Seu teste grátis <span class="gradient">começou</span></h1>
         <p>Você tem <b>10 dias</b> para testar o EXOS Profit e descobrir oportunidades reais de lucro no Mercado Livre.</p>
@@ -876,23 +863,14 @@ def auth_google_start(request: Request):
     return response
 
 
+
+
 @app.post("/auth/logout")
 def auth_logout(request: Request):
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
-
-    try:
-        delete_web_session(token)
-    except Exception as e:
-        # opcional: logar o erro no Render
-        print(f"[LOGOUT][WARN] falha ao deletar sessão: {e}")
-
+    delete_web_session(token)
     response = JSONResponse({"ok": True})
-    response.delete_cookie(
-        APP_SESSION_COOKIE_NAME,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-    )
+    response.delete_cookie(APP_SESSION_COOKIE_NAME)
     return response
 
 
@@ -1445,6 +1423,31 @@ def get_latest_inventory_mlb_stats(connected_seller_id: int) -> dict:
         "active_mlbs": int(row.get("active_mlbs") or 0),
         "paused_mlbs": int(row.get("paused_mlbs") or 0),
     }
+
+
+def get_latest_inventory_unique_skus(connected_seller_id: int) -> list[str]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH latest_run AS (
+                    SELECT max(run_id) AS run_id
+                    FROM ml.inventory_snapshot_item
+                    WHERE connected_seller_id = %s
+                )
+                SELECT DISTINCT trim(i.sku) AS sku
+                FROM ml.inventory_snapshot_item i
+                JOIN latest_run lr
+                  ON lr.run_id = i.run_id
+                WHERE i.connected_seller_id = %s
+                  AND i.sku IS NOT NULL
+                  AND trim(i.sku) <> ''
+                ORDER BY trim(i.sku)
+                """,
+                (connected_seller_id, connected_seller_id),
+            )
+            rows = cur.fetchall()
+    return [str(r[0]) for r in rows if r and r[0]]
 
 
 def badge(status: str | None) -> str:
@@ -2090,6 +2093,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
     inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
     mlb_stats = get_latest_inventory_mlb_stats(connected_seller_id)
+    latest_inventory_skus = get_latest_inventory_unique_skus(connected_seller_id)
+    can_download_min_receive_template = len(latest_inventory_skus) > 0
     inventory_plan_warning = ""
 
     if subscription:
@@ -2339,7 +2344,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 </style>
     </head>
     <body>
-        {render_staging_banner()}
         <div class="container">
             <div class="topbar">
                 <div class="user-pill">Logado como: {user.get('email')}</div>
@@ -2385,11 +2389,13 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="sku-header">
                                 <h2>SKU mínimo</h2>
 
-                                <a href="/template/sku-min-receber.csv" target="_blank" class="button-link">
+                                {f"""
+                                <a href="/template/sku-min-receber.csv?connected_seller_id={connected_seller_id}" target="_blank" class="button-link">
                                     <button class="btn btn-secondary btn-small" type="button">
                                         Baixar template
                                     </button>
                                 </a>
+                                """ if can_download_min_receive_template else ""}
                             </div>
 
                             <div class="muted">Upload de SKU x valor mínimo a receber</div>
@@ -2566,20 +2572,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             async function fetchText(url) {{ const res = await fetch(url); return await res.text(); }}
             function stopPolling() {{ if (pollingTimer) {{ clearInterval(pollingTimer); pollingTimer = null; }} }}
 
-            async function logout() {{
-                try {{
-                    const res = await fetch('/auth/logout', {{ method: 'POST' }});
-                    if (!res.ok) {{
-                        const text = await res.text();
-                        throw new Error(`Logout falhou: HTTP ${{res.status}}\n${{text}}`);
-                    }}
-                }} catch (e) {{
-                    console.error(e);
-                }} finally {{
-                    window.location.href = '/login';
-                }}
-            }}
-            
             async function logout() {{
                 await fetch('/auth/logout', {{ method: 'POST' }});
                 window.location.href = '/login';
