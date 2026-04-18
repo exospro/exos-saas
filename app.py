@@ -1749,24 +1749,23 @@ def download_template_min_receive_csv(request: Request, connected_seller_id: int
     require_connected_seller_access(int(user["id"]), connected_seller_id)
 
     skus = get_latest_inventory_unique_skus(connected_seller_id)
+
     if not skus:
-        raise HTTPException(
-            status_code=404,
-            detail="Nenhum SKU encontrado na última execução do inventory para esta conta.",
-        )
+        raise HTTPException(status_code=404, detail="Nenhum SKU encontrado.")
 
     lines = ["SKU;$_CLASSICO;$_PREMIUM"]
+
     for sku in skus:
         lines.append(f"{sku};;")
 
-    content = "
-".join(lines) + "
-"
-    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
+    content = "\n".join(lines) + "\n"
+
     return PlainTextResponse(
         content,
         media_type="text/csv",
-        headers=headers,
+        headers={
+            "Content-Disposition": 'attachment; filename="template_sku_minimo.csv"'
+        },
     )
 
 @app.get("/run/inventory")
