@@ -95,6 +95,7 @@ class ScopeItem:
     sku: str | None
     title: str | None
     status: str | None
+    listing_type_id: str | None
     price: Decimal | None
     effective_price: Decimal | None
     fee_amount_effective: Decimal | None
@@ -332,6 +333,7 @@ def fetch_scope_rows(conn, connected_seller_id: int, source_run_id: int | None =
             i.sku,
             i.title,
             i.status,
+            i.listing_type_id,
             i.price,
             i.effective_price,
             i.fee_amount_effective,
@@ -450,6 +452,34 @@ def fetch_join_key_to_cost(conn) -> dict[str, Decimal]:
     return out
 
 
+
+
+def fetch_sku_min_receive_map(conn, connected_seller_id: int) -> dict[str, dict[str, Decimal | None]]:
+    sql = """
+    SELECT
+        smr.sku,
+        smr.min_receive_classico,
+        smr.min_receive_premium
+    FROM app.account_sku_min_receive smr
+    JOIN ml.connected_seller cs
+      ON cs.account_id = smr.account_id
+    WHERE cs.id = %s
+    """
+
+    out: dict[str, dict[str, Decimal | None]] = {}
+    with conn.cursor() as cur:
+        cur.execute(sql, (connected_seller_id,))
+        for sku, min_receive_classico, min_receive_premium in cur.fetchall():
+            sku_key = str(sku or "").strip()
+            if not sku_key:
+                continue
+            out[sku_key] = {
+                "min_receive_classico": to_decimal(min_receive_classico),
+                "min_receive_premium": to_decimal(min_receive_premium),
+            }
+    return out
+
+
 def build_scope_items(conn, connected_seller_id: int, source_run_id: int | None = None, limit: int | None = None) -> list[ScopeItem]:
     rows = fetch_scope_rows(conn, connected_seller_id=connected_seller_id, source_run_id=source_run_id, limit=limit)
     if not rows:
@@ -494,6 +524,7 @@ def build_scope_items(conn, connected_seller_id: int, source_run_id: int | None 
                 sku=sku,
                 title=row.get("title"),
                 status=row.get("status"),
+                listing_type_id=row.get("listing_type_id"),
                 price=to_decimal(row.get("price")),
                 effective_price=to_decimal(row.get("effective_price")),
                 fee_amount_effective=to_decimal(row.get("fee_amount_effective")),
@@ -772,7 +803,8 @@ def normalize_candidate_promotion(item: ScopeItem, promo: dict, today_utc: datet
 
 
 def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_pct: Decimal,
-                          min_margin_pct: Decimal, max_meli_rebate_pct: Decimal, use_cost: bool) -> tuple[dict, str]:
+                          min_margin_pct: Decimal, max_meli_rebate_pct: Decimal, use_cost: bool,
+                          sku_min_receive_map: dict[str, dict[str, Decimal | None]] | None = None) -> tuple[dict, str]:
     current_price = current_price_for_comparison(item)
     if current_price is None or current_price <= 0:
         return {}, "current_price_missing"
@@ -839,8 +871,25 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
             if new_margin < min_margin_pct:
                 continue
         else:
-            if candidate_net_result < current_net_result:
-                continue
+            sku_rule_passed = False
+
+            if item.sku and sku_min_receive_map:
+                sku_limits = sku_min_receive_map.get(item.sku.strip())
+                if sku_limits:
+                    listing_type = str(item.listing_type_id or "").strip().lower()
+                    sku_min_value = None
+
+                    if listing_type == "gold_special":
+                        sku_min_value = sku_limits.get("min_receive_classico")
+                    elif listing_type == "gold_pro":
+                        sku_min_value = sku_limits.get("min_receive_premium")
+
+                    if sku_min_value is not None and candidate_net_result >= sku_min_value:
+                        sku_rule_passed = True
+
+            if not sku_rule_passed:
+                if candidate_net_result < current_net_result:
+                    continue
 
         if cand.get("status") in {"started", "active", "pending"}:
             already_started_candidates.append(cand)
@@ -1014,6 +1063,7 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
         "raw_current": {
             "current_promotion_id": item.current_promotion_id,
             "current_promotion_type": item.current_promotion_type,
+            "listing_type_id": item.listing_type_id,
             "sale_amount_current": str(item.sale_amount_current) if item.sale_amount_current is not None else None,
             "effective_price": str(item.effective_price) if item.effective_price is not None else None,
             "price": str(item.price) if item.price is not None else None,
@@ -1042,7 +1092,8 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
 def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_id: int | None, dry_run: bool, max_switch: int | None,
                   tax_pct: Decimal, min_margin_pct: Decimal, max_meli_rebate_pct: Decimal,
                   threads: int, rps: float, insecure: bool, out_csv: str, flush_every: int,
-                  use_cost: bool, mlb_filter: set[str] | None = None) -> dict:
+                  use_cost: bool, mlb_filter: set[str] | None = None,
+                  sku_min_receive_map: dict[str, dict[str, Decimal | None]] | None = None) -> dict:
     session = _mk_session(insecure=insecure)
     limiter = RateLimiter(rps)
     auth_headers = build_auth_headers(connected_seller_id)
@@ -1109,6 +1160,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 min_margin_pct=min_margin_pct,
                 max_meli_rebate_pct=max_meli_rebate_pct,
                 use_cost=use_cost,
+                sku_min_receive_map=sku_min_receive_map,
             )
             decision["tax_pct"] = tax_pct
             decision["max_meli_rebate_pct"] = max_meli_rebate_pct
@@ -1319,6 +1371,7 @@ def main():
             source_run_id=args.source_run_id,
             limit=args.limit,
         )
+        sku_min_receive_map = fetch_sku_min_receive_map(conn, connected_seller_id)
     finally:
         conn.close()
 
@@ -1345,6 +1398,7 @@ def main():
         flush_every=args.flush_every,
         use_cost=use_cost,
         mlb_filter=mlb_filter or None,
+        sku_min_receive_map=sku_min_receive_map,
     )
     print(f"[OPTIMIZER] Finalizado | processed={result.get('processed')} | switched={result.get('switched')} | errors={result.get('errors')} | no_action={result.get('no_action')}")
     print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
