@@ -876,14 +876,23 @@ def auth_google_start(request: Request):
     return response
 
 
-
-
 @app.post("/auth/logout")
 def auth_logout(request: Request):
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
-    delete_web_session(token)
+
+    try:
+        delete_web_session(token)
+    except Exception as e:
+        # opcional: logar o erro no Render
+        print(f"[LOGOUT][WARN] falha ao deletar sessão: {e}")
+
     response = JSONResponse({"ok": True})
-    response.delete_cookie(APP_SESSION_COOKIE_NAME)
+    response.delete_cookie(
+        APP_SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
     return response
 
 
@@ -2557,6 +2566,20 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             async function fetchText(url) {{ const res = await fetch(url); return await res.text(); }}
             function stopPolling() {{ if (pollingTimer) {{ clearInterval(pollingTimer); pollingTimer = null; }} }}
 
+            async function logout() {{
+                try {{
+                    const res = await fetch('/auth/logout', {{ method: 'POST' }});
+                    if (!res.ok) {{
+                        const text = await res.text();
+                        throw new Error(`Logout falhou: HTTP ${{res.status}}\n${{text}}`);
+                    }}
+                }} catch (e) {{
+                    console.error(e);
+                }} finally {{
+                    window.location.href = '/login';
+                }}
+            }}
+            
             async function logout() {{
                 await fetch('/auth/logout', {{ method: 'POST' }});
                 window.location.href = '/login';
