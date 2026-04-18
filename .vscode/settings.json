@@ -1,0 +1,7 @@
+{
+    "window.title": "🟢 EXOS STAGING",
+    "workbench.colorCustomizations": {
+        "titleBar.activeBackground": "#14532d",
+        "titleBar.activeForeground": "#ffffff"
+    }
+}
