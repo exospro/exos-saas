@@ -1257,8 +1257,6 @@ def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
                     csv_detailed_file,
                     (csv_content IS NOT NULL) AS has_csv,
                     (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
-                    csv_detailed_file,
                     error, created_at, started_at, finished_at, updated_at,
                     payload_json, result_json
                 FROM app.async_job
@@ -1363,8 +1361,6 @@ def get_job(run_id: str) -> dict:
                     csv_detailed_file,
                     (csv_content IS NOT NULL) AS has_csv,
                     (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
-                    csv_detailed_file,
                     error,
                     created_at,
                     started_at,
@@ -3001,6 +2997,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
                                 <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
                                 ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
+                                ${{j.has_csv_detailed ? `<a target="_blank" href="/download/csv_detailed?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV Detalhado</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
