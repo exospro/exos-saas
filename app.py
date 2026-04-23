@@ -2214,7 +2214,6 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         log_file=log_path.name,
         csv_file=csv_path.name,
         csv_detailed_file=csv_detailed_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
 
 
