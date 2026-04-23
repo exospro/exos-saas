@@ -35,6 +35,31 @@ DEFAULT_INSERT_PAGE_SIZE = int(os.environ.get("ML_CAMPAIGN_OPT_INSERT_PAGE_SIZE"
 SITE_ID = os.environ.get("ML_SITE_ID", "MLB")
 SHIP_ZIP = os.environ.get("ML_SHIP_ZIP", "04111080")
 
+CSV_HEADERS = {
+    "mlb": "MLB",
+    "sku": "SKU",
+    "title": "Título",
+    "status": "Status",
+    "listing_type_label": "Tipo anúncio",
+    "current_price": "Preço atual",
+    "shipping_cost": "Frete",
+    "fee_amount_current": "Tarifa atual",
+    "current_receive": "Recebimento atual",
+    "candidate_promotion_name": "Campanha sugerida",
+    "candidate_promotion_type": "Tipo da campanha",
+    "candidate_price": "Preço sugerido",
+    "candidate_shipping_cost": "Frete sugerido",
+    "candidate_rebate_meli_amount": "Rebate ML",
+    "fee_amount_candidate": "Tarifa sugerida",
+    "candidate_receive_estimated": "Recebimento estimado",
+    "sku_min_value_used": "Mínimo do SKU",
+    "delta_receive": "Diferença de recebimento",
+    "action": "Ação",
+    "execution_status": "Status execução",
+    "reason": "Motivo",
+}
+
+
 LOG_TABLE_DDL = """
 CREATE SCHEMA IF NOT EXISTS ml;
 
@@ -157,6 +182,14 @@ def first_non_empty(obj: dict, keys: list[str]):
     for key in keys:
         val = obj.get(key)
         if val not in (None, "", []):
+            return val
+    return None
+
+
+def first_positive_decimal(obj: dict, keys: list[str]) -> Decimal | None:
+    for key in keys:
+        val = to_decimal(obj.get(key))
+        if val is not None and val > 0:
             return val
     return None
 
@@ -584,24 +617,32 @@ def fetch_listing_fee(
     return {"fee_amount": q2(fee_amount), "fee_pct": fee_pct}
 
 
+def _shipping_effective_cost(opt: dict) -> Decimal | None:
+    for key in ("list_cost", "base_cost", "cost"):
+        val = to_decimal(opt.get(key))
+        if val is not None and val > 0:
+            return val
+    return None
+
+
 def pick_shipping_option(shipping_options: dict) -> dict:
     options = shipping_options.get("options") or []
     if not options:
         return {}
 
-    for opt in options:
-        if (opt.get("shipping_method_type") or "").lower() == "fulfillment":
-            return opt
+    valid_options = [opt for opt in options if _shipping_effective_cost(opt) is not None]
+    if not valid_options:
+        return {}
+
+    fulfillment_options = [opt for opt in valid_options if (opt.get("shipping_method_type") or "").lower() == "fulfillment"]
+    if fulfillment_options:
+        valid_options = fulfillment_options
 
     def opt_key(opt: dict):
-        lc = opt.get("list_cost")
-        c = opt.get("cost")
-        return (
-            lc if isinstance(lc, (int, float)) else float("inf"),
-            c if isinstance(c, (int, float)) else float("inf"),
-        )
+        eff = _shipping_effective_cost(opt)
+        return (eff if eff is not None else Decimal("999999"),)
 
-    return sorted(options, key=opt_key)[0]
+    return sorted(valid_options, key=opt_key)[0]
 
 
 def fetch_shipping_option(
@@ -626,8 +667,9 @@ def fetch_shipping_option(
 
     data = _safe_json(resp)
     chosen = pick_shipping_option(data)
+    shipping_cost = _shipping_effective_cost(chosen)
     return {
-        "shipping_list_cost": to_decimal(chosen.get("list_cost")),
+        "shipping_list_cost": q2(shipping_cost),
         "shipping_method_id": chosen.get("shipping_method_id"),
         "shipping_method_type": chosen.get("shipping_method_type"),
     }
@@ -793,7 +835,7 @@ def calculate_financials(price: Decimal, cost_product: Decimal, shipping_cost: D
     }
 
 
-def calculate_net_result(financials: dict) -> Decimal | None:
+def calculate_net_result(financials: dict, *, use_cost: bool) -> Decimal | None:
     price = to_decimal(financials.get("price"))
     tax_amount = to_decimal(financials.get("tax_amount")) or Decimal("0")
     rebate_meli_amount = to_decimal(financials.get("rebate_meli_amount")) or Decimal("0")
@@ -801,7 +843,10 @@ def calculate_net_result(financials: dict) -> Decimal | None:
     if price is None:
         return None
 
-    return q2(price - tax_amount + rebate_meli_amount)
+    if use_cost:
+        return q2(price - tax_amount + rebate_meli_amount)
+
+    return q2(price + rebate_meli_amount)
 
 
 def extract_percent(promo: dict, primary_keys: list[str]) -> Decimal | None:
@@ -835,11 +880,19 @@ def normalize_candidate_promotion(item: ScopeItem, promo: dict, today_utc: datet
         return None
 
     seller_percent = extract_percent(promo, ["seller_percent", "seller_percentage", "seller_contribution_percent"])
-    deal_price = to_decimal(first_non_empty(
+    deal_price = first_positive_decimal(
         promo,
-        ["price", "deal_price", "price_to_show", "offer_price", "max_discounted_price", "suggested_discounted_price"],
-    ))
-    if deal_price is None or deal_price <= 0:
+        [
+            "price",
+            "deal_price",
+            "price_to_show",
+            "offer_price",
+            "suggested_discounted_price",
+            "max_discounted_price",
+            "min_discounted_price",
+        ],
+    )
+    if deal_price is None:
         return None
 
     rebate_meli_amount = Decimal("0")
@@ -876,6 +929,7 @@ def normalize_candidate_promotion(item: ScopeItem, promo: dict, today_utc: datet
     return {
         "promotion_id": str(first_non_empty(promo, ["promotion_id", "id"]) or "") or None,
         "promotion_type": promotion_type,
+        "promotion_name": str(first_non_empty(promo, ["name", "promotion_name", "campaign_name"]) or "") or None,
         "offer_id": offer_id,
         "ref_id": str(first_non_empty(promo, ["ref_id", "reference_id"]) or "") or None,
         "status": status,
@@ -923,7 +977,7 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
     if current_margin is None:
         return {}, "current_margin_missing"
 
-    current_net_result = calculate_net_result(current_fin)
+    current_net_result = calculate_net_result(current_fin, use_cost=use_cost)
     if current_net_result is None:
         return {}, "current_net_result_missing"
 
@@ -933,6 +987,7 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
     today_utc = datetime.now(timezone.utc)
     candidates: list[dict] = []
     already_started_candidates: list[dict] = []
+    evaluated_candidates: list[dict] = []
     for promo in promotions_payload or []:
         if not isinstance(promo, dict):
             continue
@@ -945,24 +1000,95 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
             effective_cost_product=effective_cost_product,
         )
         if not cand:
+            raw_price = first_positive_decimal(promo, ["price", "deal_price", "price_to_show", "offer_price", "suggested_discounted_price", "max_discounted_price", "min_discounted_price"])
+            evaluated_candidates.append({
+                "promotion_id": str(first_non_empty(promo, ["promotion_id", "id"]) or "") or None,
+                "promotion_name": promo.get("name"),
+                "promotion_type": str(first_non_empty(promo, ["promotion_type", "type", "campaign_type"]) or "SELLER_CAMPAIGN"),
+                "status": str(first_non_empty(promo, ["status", "promotion_status"]) or "").strip().lower() or None,
+                "deal_price": q2(raw_price),
+                "raw": promo,
+                "analysis_status": "rejected",
+                "analysis_reason": "normalize_candidate_promotion_rejected",
+                "financials": {},
+            })
             continue
         if cand["promotion_id"] == item.current_promotion_id:
+            cand["analysis_status"] = "rejected"
+            cand["analysis_reason"] = "same_as_current_promotion"
+            evaluated_candidates.append(cand)
             continue
         new_price = cand["financials"]["price"]
         new_margin = cand["financials"]["margin_pct"]
         if new_price is None or new_margin is None:
+            cand["analysis_status"] = "rejected"
+            cand["analysis_reason"] = "candidate_price_or_margin_missing"
+            evaluated_candidates.append(cand)
             continue
         if new_price >= current_price:
+            cand["analysis_status"] = "rejected"
+            cand["analysis_reason"] = "candidate_price_not_lower_than_current"
+            evaluated_candidates.append(cand)
             continue
 
-        candidate_net_result = calculate_net_result(cand["financials"])
+        if session is not None and auth_headers is not None:
+            fee_key = (item.category_id or "", item.listing_type_id or "", str(q2(new_price)))
+            if fee_key not in fee_cache:
+                fee_cache[fee_key] = fetch_listing_fee(
+                    session,
+                    new_price,
+                    item.category_id,
+                    item.listing_type_id,
+                    auth_headers=auth_headers,
+                )
+            fee_info = fee_cache[fee_key]
+            fee_amount_candidate = to_decimal(fee_info.get("fee_amount")) or Decimal("0")
+
+            ship_key = item.mlb
+            if ship_key not in shipping_cache:
+                shipping_cache[ship_key] = fetch_shipping_option(
+                    session,
+                    item.mlb,
+                    auth_headers=auth_headers,
+                )
+            ship_info = shipping_cache[ship_key]
+            shipping_cost_candidate = to_decimal(ship_info.get("shipping_list_cost")) or Decimal("0")
+
+            cand["fee_amount_candidate"] = q2(fee_amount_candidate)
+            cand["shipping_cost_candidate"] = q2(shipping_cost_candidate)
+            cand["financials"] = calculate_financials(
+                price=new_price,
+                cost_product=effective_cost_product,
+                shipping_cost=shipping_cost_candidate,
+                fee_amount_effective=fee_amount_candidate,
+                tax_pct=tax_pct,
+                rebate_meli_amount=cand.get("rebate_meli_amount") or Decimal("0"),
+            )
+            new_margin = cand["financials"]["margin_pct"]
+            if new_margin is None:
+                cand["analysis_status"] = "rejected"
+                cand["analysis_reason"] = "candidate_margin_missing_after_recalc"
+                evaluated_candidates.append(cand)
+                continue
+
+        candidate_net_result = calculate_net_result(cand["financials"], use_cost=use_cost)
+        cand["candidate_net_result"] = candidate_net_result
         if candidate_net_result is None:
+            cand["analysis_status"] = "rejected"
+            cand["analysis_reason"] = "candidate_net_result_missing"
+            evaluated_candidates.append(cand)
             continue
 
         if use_cost:
             if new_margin < current_margin:
+                cand["analysis_status"] = "rejected"
+                cand["analysis_reason"] = "candidate_margin_below_current"
+                evaluated_candidates.append(cand)
                 continue
             if new_margin < min_margin_pct:
+                cand["analysis_status"] = "rejected"
+                cand["analysis_reason"] = "candidate_margin_below_minimum"
+                evaluated_candidates.append(cand)
                 continue
         else:
             sku_rule_applied = False
@@ -984,27 +1110,34 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
                         if session is None or auth_headers is None:
                             raise RuntimeError("session/auth_headers required for sku minimum rule")
 
-                        fee_key = (item.category_id or "", item.listing_type_id or "", str(q2(new_price)))
-                        if fee_key not in fee_cache:
-                            fee_cache[fee_key] = fetch_listing_fee(
-                                session,
-                                new_price,
-                                item.category_id,
-                                item.listing_type_id,
-                                auth_headers=auth_headers,
-                            )
-                        fee_info = fee_cache[fee_key]
-                        fee_amount_candidate = to_decimal(fee_info.get("fee_amount")) or Decimal("0")
+                        fee_amount_candidate = to_decimal(cand.get("fee_amount_candidate"))
+                        shipping_cost_candidate = to_decimal(cand.get("shipping_cost_candidate"))
 
-                        ship_key = item.mlb
-                        if ship_key not in shipping_cache:
-                            shipping_cache[ship_key] = fetch_shipping_option(
-                                session,
-                                item.mlb,
-                                auth_headers=auth_headers,
-                            )
-                        ship_info = shipping_cache[ship_key]
-                        shipping_cost_candidate = to_decimal(ship_info.get("shipping_list_cost")) or Decimal("0")
+                        if fee_amount_candidate is None:
+                            fee_key = (item.category_id or "", item.listing_type_id or "", str(q2(new_price)))
+                            if fee_key not in fee_cache:
+                                fee_cache[fee_key] = fetch_listing_fee(
+                                    session,
+                                    new_price,
+                                    item.category_id,
+                                    item.listing_type_id,
+                                    auth_headers=auth_headers,
+                                )
+                            fee_info = fee_cache[fee_key]
+                            fee_amount_candidate = to_decimal(fee_info.get("fee_amount")) or Decimal("0")
+                            cand["fee_amount_candidate"] = q2(fee_amount_candidate)
+
+                        if shipping_cost_candidate is None:
+                            ship_key = item.mlb
+                            if ship_key not in shipping_cache:
+                                shipping_cache[ship_key] = fetch_shipping_option(
+                                    session,
+                                    item.mlb,
+                                    auth_headers=auth_headers,
+                                )
+                            ship_info = shipping_cache[ship_key]
+                            shipping_cost_candidate = to_decimal(ship_info.get("shipping_list_cost")) or Decimal("0")
+                            cand["shipping_cost_candidate"] = q2(shipping_cost_candidate)
 
                         candidate_receive_estimated = q2(new_price - fee_amount_candidate - shipping_cost_candidate)
 
@@ -1015,18 +1148,30 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
                 cand["candidate_receive_estimated"] = candidate_receive_estimated
                 cand["sku_min_value_used"] = sku_min_value
                 if not sku_rule_passed:
+                    cand["analysis_status"] = "rejected"
+                    cand["analysis_reason"] = "candidate_receive_below_sku_minimum"
+                    evaluated_candidates.append(cand)
                     continue
             else:
                 if candidate_net_result < current_net_result:
+                    cand["analysis_status"] = "rejected"
+                    cand["analysis_reason"] = "candidate_net_result_below_current"
+                    evaluated_candidates.append(cand)
                     continue
 
         if cand.get("status") in {"started", "active", "pending"}:
+            cand["analysis_status"] = "approved_started"
+            cand["analysis_reason"] = "already_in_campaign"
             already_started_candidates.append(cand)
+            evaluated_candidates.append(cand)
             continue
+        cand["analysis_status"] = "approved"
+        cand["analysis_reason"] = "eligible_candidate"
         candidates.append(cand)
+        evaluated_candidates.append(cand)
 
     def _sort_key(c: dict):
-        net_result = calculate_net_result(c["financials"]) or Decimal("0")
+        net_result = calculate_net_result(c["financials"], use_cost=use_cost) or Decimal("0")
         return (
             c["financials"]["price"],
             -net_result,
@@ -1043,8 +1188,9 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
             "current_margin_pct": current_margin,
             "current_net_result": current_net_result,
             "candidate": best_started,
-            "candidate_net_result": calculate_net_result(best_started["financials"]),
+            "candidate_net_result": calculate_net_result(best_started["financials"], use_cost=use_cost),
             "use_cost": use_cost,
+            "evaluated_candidates": evaluated_candidates,
         }, "already_in_campaign"
 
     if not candidates:
@@ -1054,6 +1200,7 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
             "current_margin_pct": current_margin,
             "current_net_result": current_net_result,
             "use_cost": use_cost,
+            "evaluated_candidates": evaluated_candidates,
         }, "no_better_candidate"
 
     candidates.sort(key=_sort_key)
@@ -1064,8 +1211,9 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
         "current_margin_pct": current_margin,
         "current_net_result": current_net_result,
         "candidate": best,
-        "candidate_net_result": calculate_net_result(best["financials"]),
+        "candidate_net_result": calculate_net_result(best["financials"], use_cost=use_cost),
         "use_cost": use_cost,
+        "evaluated_candidates": evaluated_candidates,
     }, "switch"
 
 
@@ -1114,40 +1262,45 @@ def format_datetime_br(value: Any) -> str:
     return dt.astimezone().strftime("%d/%m/%Y %H:%M:%S") if dt.tzinfo else dt.strftime("%d/%m/%Y %H:%M:%S")
 
 
+
 def format_row_for_csv(row: dict) -> dict:
     out = dict(row)
     numeric_2 = [
-        "current_price", "candidate_price", "current_mc", "candidate_mc",
-        "current_rebate_meli_amount", "candidate_rebate_meli_amount",
-        "cost_product", "shipping_cost", "fee_amount_current", "fee_amount_candidate",
-        "tax_amount_current", "tax_amount_candidate",
-    ]
-    numeric_pct = [
-        "current_margin_pct", "candidate_margin_pct", "fee_pct_effective", "tax_pct",
+        "current_price",
+        "shipping_cost",
+        "fee_amount_current",
+        "current_receive",
+        "candidate_price",
+        "candidate_shipping_cost",
+        "candidate_rebate_meli_amount",
+        "fee_amount_candidate",
+        "candidate_receive_estimated",
+        "sku_min_value_used",
+        "delta_receive",
     ]
     for col in numeric_2:
         out[col] = format_decimal_br(out.get(col), 2)
-    for col in numeric_pct:
-        out[col] = format_percent_br(out.get(col), 3)
-    out["candidate_start_date"] = format_datetime_br(out.get("candidate_start_date"))
     out["dry_run"] = "true" if bool(out.get("dry_run")) else "false"
     return out
 
 
 def write_audit_csv(path: str, rows: list[dict]):
-    fieldnames = [
-        "mlb", "variation_id", "sku", "title", "status", "action", "execution_status", "reason", "dry_run",
-        "current_promotion_id", "current_promotion_type", "candidate_promotion_id", "candidate_promotion_type",
-        "candidate_start_date", "current_price", "candidate_price", "current_margin_pct", "candidate_margin_pct",
-        "current_mc", "candidate_mc", "current_rebate_meli_amount", "candidate_rebate_meli_amount",
-        "cost_product", "shipping_cost", "fee_amount_current", "fee_amount_candidate", "fee_pct_effective",
-        "tax_pct", "tax_amount_current", "tax_amount_candidate",
-    ]
+    fieldnames = list(CSV_HEADERS.keys())
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
-        writer.writeheader()
+        writer.writerow(CSV_HEADERS)
         for row in rows:
-            writer.writerow({k: format_row_for_csv(row).get(k) for k in fieldnames})
+            formatted = format_row_for_csv(row)
+            writer.writerow({k: formatted.get(k) for k in fieldnames})
+
+
+def default_detailed_csv_path(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    if not ext:
+        ext = ".csv"
+    return f"{root}_detalhado{ext}"
+
+
 
 
 def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decision: dict, action: str, execution_status: str,
@@ -1155,6 +1308,37 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
     current = decision.get("current") or {}
     candidate = decision.get("candidate") or {}
     cand_fin = candidate.get("financials") or {}
+
+    current_price = to_decimal(current.get("price"))
+    fee_amount_current = to_decimal(current.get("fee_amount")) or Decimal("0")
+    shipping_cost = item.shipping_list_cost if item.shipping_list_cost is not None else Decimal("0")
+    current_receive = None
+    if current_price is not None:
+        current_receive = q2(current_price - fee_amount_current - shipping_cost)
+
+    candidate_price = to_decimal(cand_fin.get("price"))
+    fee_amount_candidate = to_decimal(cand_fin.get("fee_amount")) or Decimal("0")
+    candidate_shipping_cost = to_decimal(candidate.get("shipping_cost_candidate"))
+    if candidate_shipping_cost is None:
+        candidate_shipping_cost = shipping_cost
+
+    candidate_receive_estimated = to_decimal(candidate.get("candidate_receive_estimated"))
+    if candidate_receive_estimated is None and candidate_price is not None:
+        candidate_receive_estimated = q2(
+            candidate_price
+            - fee_amount_candidate
+            - candidate_shipping_cost
+            + (to_decimal(cand_fin.get("rebate_meli_amount")) or Decimal("0"))
+        )
+
+    delta_receive = None
+    if current_receive is not None and candidate_receive_estimated is not None:
+        delta_receive = q2(candidate_receive_estimated - current_receive)
+
+    listing_type_label = {
+        "gold_special": "Clássico",
+        "gold_pro": "Premium",
+    }.get((item.listing_type_id or "").strip().lower(), item.listing_type_id)
 
     return {
         "connected_seller_id": connected_seller_id,
@@ -1164,23 +1348,31 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
         "sku": item.sku,
         "title": item.title,
         "status": item.status,
+        "listing_type_label": listing_type_label,
         "current_promotion_id": item.current_promotion_id,
         "current_promotion_type": item.current_promotion_type,
         "candidate_promotion_id": candidate.get("promotion_id"),
         "candidate_promotion_type": candidate.get("promotion_type"),
+        "candidate_promotion_name": candidate.get("promotion_name"),
         "candidate_start_date": candidate.get("start_date"),
         "current_price": current.get("price"),
+        "shipping_cost": shipping_cost,
+        "fee_amount_current": current.get("fee_amount"),
+        "current_receive": current_receive,
         "candidate_price": cand_fin.get("price"),
+        "candidate_rebate_meli_amount": cand_fin.get("rebate_meli_amount"),
+        "fee_amount_candidate": candidate.get("fee_amount_candidate") if candidate.get("fee_amount_candidate") is not None else cand_fin.get("fee_amount"),
+        "candidate_receive_estimated": candidate_receive_estimated,
+        "sku_min_value_used": candidate.get("sku_min_value_used"),
+        "delta_receive": delta_receive,
         "current_margin_pct": current.get("margin_pct"),
         "candidate_margin_pct": cand_fin.get("margin_pct"),
         "current_mc": current.get("mc"),
         "candidate_mc": cand_fin.get("mc"),
         "current_rebate_meli_amount": current.get("rebate_meli_amount"),
-        "candidate_rebate_meli_amount": cand_fin.get("rebate_meli_amount"),
         "cost_product": item.cost_product,
-        "shipping_cost": item.shipping_list_cost,
-        "fee_amount_current": current.get("fee_amount"),
-        "fee_amount_candidate": cand_fin.get("fee_amount"),
+        "shipping_cost_current": shipping_cost,
+        "shipping_cost_candidate": shipping_cost,
         "fee_pct_effective": item.fee_pct_effective,
         "tax_pct": decision.get("tax_pct"),
         "tax_amount_current": current.get("tax_amount"),
@@ -1200,6 +1392,8 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
             "cost_detail": item.cost_detail,
             "cost_missing_mapping": item.cost_missing_mapping,
             "cost_missing_price": item.cost_missing_price,
+            "listing_type_id": item.listing_type_id,
+            "listing_type_label": listing_type_label,
         },
         "raw_candidate": candidate.get("raw"),
         "raw_decision": {
@@ -1209,20 +1403,105 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
             "max_meli_rebate_pct": str(decision.get("max_meli_rebate_pct")) if decision.get("max_meli_rebate_pct") is not None else None,
             "candidate_offer_id": candidate.get("offer_id"),
             "candidate_ref_id": candidate.get("ref_id"),
+            "candidate_promotion_name": candidate.get("promotion_name"),
             "current_net_result": str(decision.get("current_net_result")) if decision.get("current_net_result") is not None else None,
             "candidate_net_result": str(decision.get("candidate_net_result")) if decision.get("candidate_net_result") is not None else None,
             "candidate_receive_estimated": str(candidate.get("candidate_receive_estimated")) if candidate.get("candidate_receive_estimated") is not None else None,
+            "candidate_shipping_cost": str(candidate.get("shipping_cost_candidate")) if candidate.get("shipping_cost_candidate") is not None else None,
             "sku_min_value_used": str(candidate.get("sku_min_value_used")) if candidate.get("sku_min_value_used") is not None else None,
+            "fee_amount_candidate_recalculated": str(candidate.get("fee_amount_candidate")) if candidate.get("fee_amount_candidate") is not None else None,
+            "shipping_cost_candidate_recalculated": str(candidate.get("shipping_cost_candidate")) if candidate.get("shipping_cost_candidate") is not None else None,
             "listing_type_id": item.listing_type_id,
+            "listing_type_label": listing_type_label,
             "use_cost": use_cost,
         },
         "raw_api_result": api_result,
     }
 
 
+def build_detailed_rows_from_decision(base_row: dict, item: ScopeItem, decision: dict, decision_reason: str, dry_run: bool) -> list[dict]:
+    rows: list[dict] = []
+    current = decision.get("current") or {}
+    current_price = to_decimal(current.get("price"))
+    fee_amount_current = to_decimal(current.get("fee_amount")) or Decimal("0")
+    shipping_cost = to_decimal(base_row.get("shipping_cost")) or Decimal("0")
+    current_receive = to_decimal(base_row.get("current_receive"))
+    listing_type_label = base_row.get("listing_type_label")
+
+    for cand in decision.get("evaluated_candidates") or []:
+        cand_fin = cand.get("financials") or {}
+        candidate_price = to_decimal(cand_fin.get("price") or cand.get("deal_price"))
+        fee_amount_candidate = to_decimal(cand.get("fee_amount_candidate"))
+        if fee_amount_candidate is None:
+            fee_amount_candidate = to_decimal(cand_fin.get("fee_amount")) or Decimal("0")
+        candidate_shipping_cost = to_decimal(cand.get("shipping_cost_candidate"))
+        if candidate_shipping_cost is None:
+            candidate_shipping_cost = shipping_cost
+        candidate_receive_estimated = to_decimal(cand.get("candidate_receive_estimated"))
+        if candidate_receive_estimated is None and candidate_price is not None:
+            candidate_receive_estimated = q2(
+                candidate_price
+                - fee_amount_candidate
+                - candidate_shipping_cost
+                + (to_decimal(cand_fin.get("rebate_meli_amount")) or Decimal("0"))
+            )
+        delta_receive = None
+        if current_receive is not None and candidate_receive_estimated is not None:
+            delta_receive = q2(candidate_receive_estimated - current_receive)
+
+        row = {
+            "connected_seller_id": base_row.get("connected_seller_id"),
+            "run_id": base_row.get("run_id"),
+            "mlb": item.mlb,
+            "variation_id": item.variation_id,
+            "sku": item.sku,
+            "title": item.title,
+            "status": item.status,
+            "listing_type_label": listing_type_label,
+            "current_price": current_price,
+            "shipping_cost": shipping_cost,
+            "fee_amount_current": fee_amount_current,
+            "current_receive": current_receive,
+            "candidate_promotion_name": cand.get("promotion_name"),
+            "candidate_promotion_id": cand.get("promotion_id"),
+            "candidate_promotion_type": cand.get("promotion_type"),
+            "candidate_price": candidate_price,
+            "candidate_shipping_cost": candidate_shipping_cost,
+            "candidate_rebate_meli_amount": to_decimal(cand_fin.get("rebate_meli_amount")) or to_decimal(cand.get("rebate_meli_amount")),
+            "fee_amount_candidate": fee_amount_candidate,
+            "candidate_receive_estimated": candidate_receive_estimated,
+            "sku_min_value_used": to_decimal(cand.get("sku_min_value_used")),
+            "delta_receive": delta_receive,
+            "action": "SWITCH" if cand.get("analysis_status") in {"approved", "approved_started"} else "SKIP",
+            "execution_status": "campaign_approved" if cand.get("analysis_status") in {"approved", "approved_started"} else "campaign_rejected",
+            "reason": cand.get("analysis_reason") or decision_reason,
+            "dry_run": dry_run,
+            "raw_current": base_row.get("raw_current"),
+            "raw_candidate": cand.get("raw"),
+            "raw_decision": {
+                "analysis_status": cand.get("analysis_status"),
+                "analysis_reason": cand.get("analysis_reason"),
+                "current_price_comparison": str(decision.get("current_price")) if decision.get("current_price") is not None else None,
+                "current_net_result": str(decision.get("current_net_result")) if decision.get("current_net_result") is not None else None,
+                "candidate_net_result": str(cand.get("candidate_net_result")) if cand.get("candidate_net_result") is not None else None,
+                "candidate_ref_id": cand.get("ref_id"),
+                "candidate_offer_id": cand.get("offer_id"),
+                "sku_min_value_used": str(cand.get("sku_min_value_used")) if cand.get("sku_min_value_used") is not None else None,
+                "candidate_receive_estimated": str(candidate_receive_estimated) if candidate_receive_estimated is not None else None,
+            },
+            "raw_api_result": None,
+        }
+        rows.append(row)
+
+    if not rows:
+        # fallback line even when no campaign could be normalized
+        rows.append(dict(base_row))
+    return rows
+
+
 def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_id: int | None, dry_run: bool, max_switch: int | None,
                   tax_pct: Decimal, min_margin_pct: Decimal, max_meli_rebate_pct: Decimal,
-                  threads: int, rps: float, insecure: bool, out_csv: str, flush_every: int,
+                  threads: int, rps: float, insecure: bool, out_csv: str, out_detailed_csv: str | None, flush_every: int,
                   use_cost: bool, mlb_filter: set[str] | None = None,
                   sku_min_receive_map: dict[str, dict[str, Decimal | None]] | None = None) -> dict:
     session = _mk_session(insecure=insecure)
@@ -1239,6 +1518,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
     conn = db_connect()
     run_id = None
     audit_rows: list[dict] = []
+    detailed_audit_rows: list[dict] = []
     pending_rows: list[dict] = []
     switched = 0
     processed = 0
@@ -1267,6 +1547,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 "rps": rps,
                 "insecure": insecure,
                 "out_csv": out_csv,
+                "out_detailed_csv": out_detailed_csv,
                 "flush_every": flush_every,
                 "use_cost": use_cost,
                 "mlb_filter_count": len(mlb_filter or set()),
@@ -1304,23 +1585,27 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
             decision["use_cost"] = use_cost
 
             if reason == "already_in_campaign":
-                return build_log_row(connected_seller_id, run_id, item, decision, action="SKIP", execution_status="already_started_or_pending",
+                row = build_log_row(connected_seller_id, run_id, item, decision, action="SKIP", execution_status="already_started_or_pending",
                                      reason=reason, dry_run=dry_run, use_cost=use_cost)
+                return row, build_detailed_rows_from_decision(row, item, decision, reason, dry_run)
 
             if reason != "switch":
-                return build_log_row(connected_seller_id, run_id, item, decision, action="SKIP", execution_status="not_applicable",
+                row = build_log_row(connected_seller_id, run_id, item, decision, action="SKIP", execution_status="not_applicable",
                                      reason=reason, dry_run=dry_run, use_cost=use_cost)
+                return row, build_detailed_rows_from_decision(row, item, decision, reason, dry_run)
 
             candidate = decision["candidate"]
             if dry_run:
-                return build_log_row(connected_seller_id, run_id, item, decision, action="SWITCH", execution_status="dry_run",
+                row = build_log_row(connected_seller_id, run_id, item, decision, action="SWITCH", execution_status="dry_run",
                                      reason="eligible_candidate", dry_run=True, use_cost=use_cost)
+                return row, build_detailed_rows_from_decision(row, item, decision, "eligible_candidate", True)
 
             with switch_count_lock:
                 nonlocal switch_success_count
                 if max_switch is not None and switch_success_count >= max_switch:
-                    return build_log_row(connected_seller_id, run_id, item, decision, action="SKIP", execution_status="not_applicable",
+                    row = build_log_row(connected_seller_id, run_id, item, decision, action="SKIP", execution_status="not_applicable",
                                          reason="max_switch_reached", dry_run=False, use_cost=use_cost)
+                    return row, build_detailed_rows_from_decision(row, item, decision, "max_switch_reached", False)
 
             api_result = campaign_item_upsert(
                 session=session,
@@ -1335,11 +1620,13 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
             if api_result.get("ok"):
                 with switch_count_lock:
                     switch_success_count += 1
-                return build_log_row(connected_seller_id, run_id, item, decision, action="SWITCH", execution_status="success",
+                row = build_log_row(connected_seller_id, run_id, item, decision, action="SWITCH", execution_status="success",
                                      reason="eligible_candidate", dry_run=False, use_cost=use_cost, api_result=api_result)
-            return build_log_row(connected_seller_id, run_id, item, decision, action="SWITCH", execution_status="error",
+                return row, build_detailed_rows_from_decision(row, item, decision, "eligible_candidate", False)
+            row = build_log_row(connected_seller_id, run_id, item, decision, action="SWITCH", execution_status="error",
                                  reason=api_result.get("error_code") or "api_error", dry_run=False,
                                  use_cost=use_cost, api_result=api_result)
+            return row, build_detailed_rows_from_decision(row, item, decision, api_result.get("error_code") or "api_error", False)
 
         with ThreadPoolExecutor(max_workers=threads) as ex:
             futures = {ex.submit(worker, item): item for item in items}
@@ -1347,7 +1634,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
             for fut in as_completed(futures):
                 processed += 1
                 try:
-                    row = fut.result()
+                    row, detailed_rows = fut.result()
                 except Exception as exc:
                     item = futures[fut]
                     row = {
@@ -1366,8 +1653,12 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                         "current_promotion_type": item.current_promotion_type,
                         "candidate_promotion_id": None,
                         "candidate_promotion_type": None,
+                        "candidate_promotion_name": None,
                         "candidate_start_date": None,
                         "current_price": current_price_for_comparison(item),
+                        "shipping_cost_current": item.shipping_list_cost,
+                        "fee_amount_current": item.fee_amount_effective,
+                        "current_receive": None,
                         "candidate_price": None,
                         "current_margin_pct": None,
                         "candidate_margin_pct": None,
@@ -1375,6 +1666,10 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                         "candidate_mc": None,
                         "current_rebate_meli_amount": item.rebate_meli_amount,
                         "candidate_rebate_meli_amount": None,
+                        "shipping_cost_candidate": None,
+                        "candidate_receive_estimated": None,
+                        "sku_min_value_used": None,
+                        "delta_receive": None,
                         "cost_product": item.cost_product,
                         "shipping_cost": item.shipping_list_cost,
                         "fee_amount_current": item.fee_amount_effective,
@@ -1388,8 +1683,10 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                         "raw_decision": {"use_cost": use_cost},
                         "raw_api_result": None,
                     }
+                    detailed_rows = [dict(row)]
 
                 audit_rows.append(row)
+                detailed_audit_rows.extend(detailed_rows)
                 pending_rows.append(row)
 
                 if row.get("action") == "SWITCH" and row.get("execution_status") in {"success", "dry_run"}:
@@ -1413,6 +1710,8 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
 
         flush_logs()
         write_audit_csv(out_csv, audit_rows)
+        if out_detailed_csv:
+            write_audit_csv(out_detailed_csv, detailed_audit_rows)
 
         finish_run(
             conn,
@@ -1427,6 +1726,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 "dry_run": dry_run,
                 "use_cost": use_cost,
                 "out_csv": out_csv,
+                "out_detailed_csv": out_detailed_csv,
             },
         )
         conn.commit()
@@ -1439,6 +1739,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
             "no_action": no_action,
             "use_cost": use_cost,
             "out_csv": out_csv,
+            "out_detailed_csv": out_detailed_csv,
         }
     except Exception as e:
         try:
@@ -1482,6 +1783,7 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true", help="Simula decisões sem alterar campanhas")
     p.add_argument("--insecure", action="store_true", help="Desativa validação SSL (debug)")
     p.add_argument("--out", default=None, help="CSV de auditoria")
+    p.add_argument("--out-detailed", default=None, help="CSV detalhado por campanha analisada")
     p.add_argument("--flush-every", type=int, default=DEFAULT_FLUSH_EVERY)
     p.add_argument("--use-cost", type=parse_bool, default=DEFAULT_USE_COST,
                    help="Usa custo do produto nas regras (true/false). Default atual: false para onboarding inicial")
@@ -1513,6 +1815,7 @@ def main():
         conn.close()
 
     out_csv = args.out or f"campaign_optimizer_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    out_detailed_csv = args.out_detailed or default_detailed_csv_path(out_csv)
 
     print(
         f"[OPTIMIZER] Iniciando | scope_items={len(items)} | dry_run={args.dry_run} | use_cost={use_cost} | tax_pct={tax_pct} | "
@@ -1532,6 +1835,7 @@ def main():
         rps=args.rps,
         insecure=args.insecure,
         out_csv=out_csv,
+        out_detailed_csv=out_detailed_csv,
         flush_every=args.flush_every,
         use_cost=use_cost,
         mlb_filter=mlb_filter or None,
