@@ -2780,7 +2780,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar (não altera campanhas)</label></div>
-                    <div class="muted" style="margin-top:5px; margin-top:10px; line-height:1.5;">
+                    <div class="muted" style="margin-top:5px; line-height:1.5;">
                         * Se Simular antes de aplicar estiver marcado, nada será alterado no Mercado Livre.
                     </div>
                     <!--<div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Considerar custo do produto na decisão</label></div>-->
@@ -2790,7 +2790,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar anúncios e fretes</button>
                             <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Aplicar melhor campanha</button>
                         </div>
-                        <div class="muted" style="margin-top:5px; margin-top:10px; line-height:1.5;">
+                        <div class="muted" style="margin-top:5px;  line-height:1.5;">
                             * Aplicar melhor campanha atualiza os rebates/campanhas disponíveis e depois aplica a melhora campanha.
                         </div>
                         <div class="small-grid">
