@@ -1978,6 +1978,7 @@ def run_optimizer(request: Request, connected_seller_id: int = 1, limit: int = 0
     require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     csv_path = build_csv_path()
+    csv_detailed_path = build_detailed_csv_path()
     cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return {
