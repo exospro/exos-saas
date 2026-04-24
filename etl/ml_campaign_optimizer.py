@@ -60,6 +60,52 @@ CSV_HEADERS = {
 }
 
 
+ACTION_LABELS = {
+    "SKIP": "Manter como está",
+    "SWITCH": "Alterar campanha",
+}
+
+EXECUTION_STATUS_LABELS = {
+    "not_applicable": "Não aplicável",
+    "already_started_or_pending": "Já está em campanha",
+    "dry_run": "Simulação",
+    "success": "Aplicado com sucesso",
+    "error": "Erro",
+    "campaign_approved": "Campanha aprovada",
+    "campaign_rejected": "Campanha rejeitada",
+}
+
+REASON_LABELS = {
+    "no_better_candidate": "Nenhuma campanha melhor encontrada",
+    "already_in_campaign": "Produto já está nessa campanha",
+    "eligible_candidate": "Campanha elegível",
+    "candidate_receive_below_sku_minimum": "Recebimento abaixo do mínimo do SKU",
+    "candidate_net_result_below_current": "Recebimento menor que o atual",
+    "candidate_price_not_lower_than_current": "Preço sugerido não é menor que o atual",
+    "same_as_current_promotion": "É a mesma campanha atual",
+    "normalize_candidate_promotion_rejected": "Campanha incompatível com as regras",
+    "candidate_price_or_margin_missing": "Preço ou margem da campanha ausente",
+    "candidate_net_result_missing": "Recebimento estimado ausente",
+    "candidate_margin_missing_after_recalc": "Margem da campanha ausente após recálculo",
+    "candidate_margin_below_current": "Margem menor que a atual",
+    "candidate_margin_below_minimum": "Margem abaixo da mínima",
+    "current_price_missing": "Preço atual ausente",
+    "current_margin_missing": "Margem atual ausente",
+    "current_net_result_missing": "Recebimento atual ausente",
+    "missing_cost_mapping": "SKU sem mapeamento de custo",
+    "missing_join_key_cost": "Custo do fornecedor ausente",
+    "missing_cost_product": "Custo do produto ausente",
+    "max_switch_reached": "Limite de alterações atingido",
+}
+
+
+def label_for_csv(mapping: dict[str, str], value: Any) -> Any:
+    if value in (None, ""):
+        return value
+    text = str(value)
+    return mapping.get(text, text)
+
+
 LOG_TABLE_DDL = """
 CREATE SCHEMA IF NOT EXISTS ml;
 
@@ -1271,6 +1317,13 @@ def format_datetime_br(value: Any) -> str:
 
 def format_row_for_csv(row: dict) -> dict:
     out = dict(row)
+
+    # Frete sugerido deve acompanhar o frete atual quando não houver valor específico do candidato.
+    # Isso evita CSV com a coluna "Frete sugerido" em branco em cenários sem campanha elegível
+    # ou quando o frete candidato não foi recalculado separadamente.
+    if out.get("candidate_shipping_cost") in (None, ""):
+        out["candidate_shipping_cost"] = out.get("shipping_cost")
+
     numeric_2 = [
         "current_price",
         "shipping_cost",
@@ -1286,9 +1339,15 @@ def format_row_for_csv(row: dict) -> dict:
     ]
     for col in numeric_2:
         out[col] = format_decimal_br(out.get(col), 2)
+
+    # Traduções apenas para a experiência do usuário no CSV.
+    # Os valores técnicos continuam preservados no banco/raw_decision.
+    out["action"] = label_for_csv(ACTION_LABELS, out.get("action"))
+    out["execution_status"] = label_for_csv(EXECUTION_STATUS_LABELS, out.get("execution_status"))
+    out["reason"] = label_for_csv(REASON_LABELS, out.get("reason"))
+
     out["dry_run"] = "true" if bool(out.get("dry_run")) else "false"
     return out
-
 
 def write_audit_csv(path: str, rows: list[dict]):
     fieldnames = list(CSV_HEADERS.keys())
@@ -1366,6 +1425,7 @@ def build_log_row(connected_seller_id: int, run_id: int, item: ScopeItem, decisi
         "fee_amount_current": current.get("fee_amount"),
         "current_receive": current_receive,
         "candidate_price": cand_fin.get("price"),
+        "candidate_shipping_cost": candidate_shipping_cost,
         "candidate_rebate_meli_amount": cand_fin.get("rebate_meli_amount"),
         "fee_amount_candidate": candidate.get("fee_amount_candidate") if candidate.get("fee_amount_candidate") is not None else cand_fin.get("fee_amount"),
         "candidate_receive_estimated": candidate_receive_estimated,
@@ -1672,6 +1732,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                         "candidate_mc": None,
                         "current_rebate_meli_amount": item.rebate_meli_amount,
                         "candidate_rebate_meli_amount": None,
+                        "candidate_shipping_cost": item.shipping_list_cost,
                         "shipping_cost_candidate": None,
                         "candidate_receive_estimated": None,
                         "sku_min_value_used": None,
