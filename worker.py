@@ -22,57 +22,32 @@ WORKER_NAME = os.environ.get("ASYNC_JOB_WORKER_NAME", "worker-1")
 KEEP_LAST_FINISHED_JOBS_PER_SELLER = int(os.environ.get("ASYNC_JOB_KEEP_LAST_FINISHED", "1"))
 
 
-
-def ensure_async_job_csv_columns() -> None:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                ALTER TABLE app.async_job
-                    ADD COLUMN IF NOT EXISTS csv_detailed_file TEXT,
-                    ADD COLUMN IF NOT EXISTS csv_detailed_content TEXT,
-                    ADD COLUMN IF NOT EXISTS csv_detailed_mime_type TEXT,
-                    ADD COLUMN IF NOT EXISTS csv_detailed_bytes BIGINT
-                """
-            )
-        conn.commit()
-
-
 def append_log(log_path: Path, message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {message.rstrip()}\n")
 
 
-def save_csv_to_job(run_id: str, csv_path: Path | None, *, detailed: bool = False) -> bool:
+def save_csv_to_job(run_id: str, csv_path: Path | None) -> bool:
     if not csv_path or not csv_path.exists() or not csv_path.is_file():
         return False
 
     content = csv_path.read_text(encoding="utf-8", errors="replace")
     size = csv_path.stat().st_size
 
-    if detailed:
-        sql = """
-                UPDATE app.async_job
-                   SET csv_detailed_content = %s,
-                       csv_detailed_bytes = %s,
-                       csv_detailed_mime_type = 'text/csv',
-                       updated_at = now()
-                 WHERE run_id = %s
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
                 """
-    else:
-        sql = """
                 UPDATE app.async_job
                    SET csv_content = %s,
                        csv_bytes = %s,
                        csv_mime_type = 'text/csv',
                        updated_at = now()
                  WHERE run_id = %s
-                """
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (content, size, run_id))
+                """,
+                (content, size, run_id),
+            )
         conn.commit()
     return True
 
@@ -106,7 +81,6 @@ def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_las
 
 
 def claim_next_job() -> dict | None:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -132,8 +106,7 @@ def claim_next_job() -> dict | None:
                     j.connected_seller_id,
                     j.payload_json,
                     j.log_file,
-                    j.csv_file,
-                    j.csv_detailed_file
+                    j.csv_file
                 """
             )
             row = cur.fetchone()
@@ -149,7 +122,6 @@ def update_job(
     error: str | None = None,
     result_json: dict | None = None,
     csv_file: str | None = None,
-    csv_detailed_file: str | None = None,
     finished: bool = False,
 ) -> None:
     sets = ["updated_at = now()"]
@@ -170,9 +142,6 @@ def update_job(
     if csv_file is not None:
         sets.append("csv_file = %s")
         params.append(csv_file)
-    if csv_detailed_file is not None:
-        sets.append("csv_detailed_file = %s")
-        params.append(csv_detailed_file)
     if finished:
         sets.append("finished_at = now()")
 
@@ -207,22 +176,19 @@ def run_command(cmd: list[str], log_path: Path, label: str) -> dict:
     }
 
 
-def maybe_store_csv_for_job(run_id: str, csv_file: str | None, log_path: Path, *, detailed: bool = False) -> None:
+def maybe_store_csv_for_job(run_id: str, csv_file: str | None, log_path: Path) -> None:
     if not csv_file:
         return
     csv_path = CSV_DIR / csv_file
-    if save_csv_to_job(run_id, csv_path, detailed=detailed):
-        kind = "CSV detalhado" if detailed else "CSV"
-        append_log(log_path, f"[WORKER] {kind} salvo no banco | run_id={run_id} | csv_file={csv_file}")
+    if save_csv_to_job(run_id, csv_path):
+        append_log(log_path, f"[WORKER] CSV salvo no banco | run_id={run_id} | csv_file={csv_file}")
     else:
-        kind = "CSV detalhado" if detailed else "CSV"
-        append_log(log_path, f"[WORKER] {kind} não encontrado para salvar no banco | run_id={run_id} | csv_file={csv_file}")
+        append_log(log_path, f"[WORKER] CSV não encontrado para salvar no banco | run_id={run_id} | csv_file={csv_file}")
 
 
-def finalize_and_cleanup(run_id: str, connected_seller_id: int, log_path: Path, *, result_json: dict, csv_file: str | None, csv_detailed_file: str | None = None) -> None:
+def finalize_and_cleanup(run_id: str, connected_seller_id: int, log_path: Path, *, result_json: dict, csv_file: str | None) -> None:
     maybe_store_csv_for_job(run_id, csv_file, log_path)
-    maybe_store_csv_for_job(run_id, csv_detailed_file, log_path, detailed=True)
-    update_job(run_id, status="finished", step="done", result_json=result_json, csv_file=csv_file, csv_detailed_file=csv_detailed_file, finished=True)
+    update_job(run_id, status="finished", step="done", result_json=result_json, csv_file=csv_file, finished=True)
 
     deleted = purge_old_finished_jobs(
         connected_seller_id=connected_seller_id,
@@ -242,7 +208,6 @@ def run_single_job(job: dict) -> None:
     payload = job.get("payload_json") or {}
     log_path = LOG_DIR / (job.get("log_file") or f"{run_id}.log")
     csv_file = job.get("csv_file")
-    csv_detailed_file = job.get("csv_detailed_file")
 
     append_log(
         log_path,
@@ -257,7 +222,7 @@ def run_single_job(job: dict) -> None:
             result_json["inventory"] = result
             if result["returncode"] != 0:
                 raise RuntimeError("Inventory falhou")
-            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=None, csv_detailed_file=None)
+            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=None)
 
         elif job_type == "rebate":
             update_job(run_id, step="rebate")
@@ -265,29 +230,27 @@ def run_single_job(job: dict) -> None:
             result_json["rebate"] = result
             if result["returncode"] != 0:
                 raise RuntimeError("Rebate falhou")
-            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=None, csv_detailed_file=None)
+            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=None)
 
         elif job_type == "optimizer":
-            # Fluxo novo do botão principal: atualiza rebate antes de rodar o optimizer.
-            # Mantém compatibilidade: se o payload antigo não tiver rebate_cmd, roda só o optimizer.
-            rebate_cmd = payload.get("rebate_cmd")
-            if rebate_cmd:
+            # Novo fluxo do botão "Aplicar melhor campanha":
+            # primeiro atualiza rebates/campanhas disponíveis, depois roda o optimizer.
+            if payload.get("rebate_cmd"):
                 update_job(run_id, step="rebate", result_json=result_json)
-                append_log(log_path, "[PIPELINE] Etapa 1/2 - Rebate: iniciando antes do optimizer")
-                r1 = run_command(rebate_cmd, log_path, "REBATE")
+                append_log(log_path, "[PIPELINE] Optimizer - Etapa 1/2 - Rebate: iniciando")
+                r1 = run_command(payload["rebate_cmd"], log_path, "REBATE")
                 result_json["rebate"] = r1
+                update_job(run_id, step="rebate", result_json=result_json)
                 if r1["returncode"] != 0:
                     raise RuntimeError("Rebate falhou")
-            else:
-                append_log(log_path, "[PIPELINE] rebate_cmd ausente no payload; seguindo apenas com optimizer")
 
             update_job(run_id, step="optimizer", result_json=result_json)
-            append_log(log_path, "[PIPELINE] Etapa 2/2 - Optimizer: iniciando")
+            append_log(log_path, "[PIPELINE] Optimizer - Etapa 2/2 - Optimizer: iniciando")
             result = run_command(payload["cmd"], log_path, "OPTIMIZER")
             result_json["optimizer"] = result
             if result["returncode"] != 0:
                 raise RuntimeError("Optimizer falhou")
-            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=csv_file, csv_detailed_file=csv_detailed_file)
+            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=csv_file)
 
         elif job_type == "full":
             update_job(run_id, step="inventory", result_json=result_json)
@@ -311,7 +274,7 @@ def run_single_job(job: dict) -> None:
             if r3["returncode"] != 0:
                 raise RuntimeError("Optimizer falhou")
 
-            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=csv_file, csv_detailed_file=csv_detailed_file)
+            finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=csv_file)
 
         else:
             raise RuntimeError(f"job_type inválido: {job_type}")

@@ -1995,10 +1995,7 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         limit_items=limit,
         dry_run=dry_run,
         use_cost=use_cost,
-        payload={
-            "rebate_cmd": build_rebate_cmd(connected_seller_id, limit),
-            "cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path),
-        },
+        payload={"cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path)},
         log_file=log_path.name,
         csv_file=csv_path.name,
     )
@@ -2433,26 +2430,18 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div class="scope-help">Rebate, Optimizer e Otimização Completa usam o escopo do plano. Inventory pode mapear toda a conta para sinalizar excedentes.</div>
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
-                    <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar</label></div>
-                    <div class="muted" style="margin-top:5px; line-height:1.5;">Se Simular antes de aplicar estiver marcado, nada será alterado no Mercado Livre.</div>
+                    <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simulação (não altera campanhas)</label></div>
                     <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>
-                    <div class="warn-box" id="activeJobWarn" style="display:none;"></div>
+                    <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
-                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar anúncios e fretes</button>
-                            <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Aplicar melhor campanha</button>
-                        </div>
-                        <div class="muted" style="margin-top:5px; line-height:1.5;">
-                            Aplicar melhor campanha atualiza os rebates/campanhas disponíveis e depois roda o optimizer.
-                        </div>
-                        <div class="small-grid" style="margin-top:12px;">
-                            <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar atualização completa</button>
-                        </div>
-                        <div class="muted" style="margin-top:5px; line-height:1.5;">
-                            Rodar atualização completa executa todo o processo: atualiza anúncios e fretes, atualiza rebates/campanhas disponíveis e depois ativa melhor campanha.
+                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar MLBs</button>
+                            <button class="btn btn-secondary" onclick="rodarRebateAsync()">Atualizar Rebate</button>
+                            <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Ativar Campanha Vencedora</button>
+                            <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar Otimização Completa</button>
                         </div>
                     </div>
-                    <!--<div class="muted" id="jobInfo"></div>-->
+                    <div class="muted" id="jobInfo"></div>
                     <div class="summary-card">
                         <div class="summary-title">Resumo geral</div>
                         <div class="summary-headline" id="summaryHeadline">Nenhum job executado ainda.</div>
@@ -2580,8 +2569,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     return;
                 }}
                 box.style.display = "block";
-                //box.innerText = `Já existe job em andamento: ${{active.job_type}} | status=${{active.status}} | etapa=${{active.step || '-'}} | run_id=${{active.run_id}}`;
-                box.innerText = `Já existe job em andamento, aguarde sua finalização`;
+                box.innerText = `Já existe job em andamento: ${{active.job_type}} | status=${{active.status}} | etapa=${{active.step || '-'}} | run_id=${{active.run_id}}`;
             }}
 
             async function fetchJson(url, options = undefined) {{
@@ -2695,8 +2683,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                                 <div>${{j.step || '-'}}</div>
                             </div>
                             <div style="margin-top:6px">${{j.summary?.headline || ''}}</div>
-                            <!--<div style="margin-top:6px; color:#9fb0d9">run_id=${{j.run_id}}</div>-->
-                            <!--<div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>-->
+                            <div style="margin-top:6px; color:#9fb0d9">run_id=${{j.run_id}}</div>
+                            <div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>
                             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
@@ -2775,29 +2763,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             refreshRecentJobs();
             refreshInvites();
             refreshMinReceive();
-        
-function renderActiveJobWarn(data) {{
-  const el = document.getElementById('activeJobWarn');
-
-  if (!el) return; // 👈 ESSENCIAL
-
-  let msg = "⚠️ Já existe uma atualização em andamento. Aguarde a conclusão antes de iniciar outra.";
-
-  try {{
-    const st = data?.status || data?.detail?.status;
-
-    if (st === 'queued') {{
-      msg = "⏳ Sua solicitação está na fila. Em breve será iniciada.";
-    }} else if (st === 'running') {{
-      msg = "🔄 Estamos processando sua otimização agora.";
-    }}
-  }} catch(e){{}}
-
-  el.innerText = msg;
-  el.style.display = 'block';
-}}
-
-</script>
+        </script>
     </body>
     </html>
     """
