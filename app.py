@@ -2768,8 +2768,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="muted" id="minReceiveInfo" style="margin-top:10px;"></div>
 
                         </div>
-
-                        <div class="muted">Escolha se deseja apenas simular ou aplicar a melhor campanha encontrada para cada anúncio.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
                     </div>
                     <div class="form-row">
@@ -2779,7 +2777,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar (não altera campanhas)</label></div>
-                    <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Considerar custo do produto na decisão</label></div>
+                    <div class="muted"> Se <strong>Simular antes de aplicar</strong> estiver marcado, nada será alterado no Mercado Livre.</div>
+                    <!--<div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Considerar custo do produto na decisão</label></div>-->
                     <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
@@ -2788,8 +2787,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar atualização completa</button>
                         </div>
                         <div class="muted" style="margin-top:10px; line-height:1.5;">
-                            <strong>Aplicar melhor campanha</strong> atualiza os rebates/campanhas disponíveis e depois roda o optimizer.
-                            Se <strong>Simular antes de aplicar</strong> estiver marcado, nada será alterado no Mercado Livre.
+                            <strong>* Aplicar melhor campanha</strong> atualiza os rebates/campanhas disponíveis e depois ativa o MLB na melhor campanha.
                         </div>
                     </div>
                     <div class="muted" id="jobInfo"></div>
