@@ -27,6 +27,7 @@ SHIP_ZIP = "04111080"
 MAX_PAGE_SIZE = 100
 DEFAULT_MAX_WORKERS = 5
 DEFAULT_BATCH_SIZE = 50
+INVENTORY_SHIPPING_RULE_VERSION = "slow_priority_v1_debug"
 
 
 def get_headers(connected_seller_id: int) -> dict[str, str]:
@@ -407,6 +408,25 @@ def fetch_shipping_option(
 
     data = _safe_json(resp)
     chosen = pick_shipping_option(data)
+
+    # DEBUG/VALIDAÇÃO: mostra exatamente qual opção foi escolhida pela regra de frete
+    chosen_method = chosen.get("shipping_method_type")
+    chosen_list = chosen.get("list_cost")
+    chosen_base = chosen.get("base_cost")
+    chosen_cost = chosen.get("cost")
+    slow_opts = [o for o in (data.get("options") or []) if (o.get("shipping_method_type") or "").strip().lower() == "slow"]
+    if slow_opts:
+        s0 = slow_opts[0]
+        print(
+            f"[INVENTORY][FRETE] mlb={item_id} | escolhido={chosen_method} "
+            f"list_cost={chosen_list} base_cost={chosen_base} cost={chosen_cost} | "
+            f"slow_disponivel=list_cost:{s0.get('list_cost')} base_cost:{s0.get('base_cost')} cost:{s0.get('cost')}"
+        )
+    else:
+        print(
+            f"[INVENTORY][FRETE] mlb={item_id} | escolhido={chosen_method} "
+            f"list_cost={chosen_list} base_cost={chosen_base} cost={chosen_cost} | slow_disponivel=nao"
+        )
 
     shipping_cost = to_decimal(chosen.get("list_cost"))
     if shipping_cost is None or shipping_cost <= 0:
@@ -836,6 +856,7 @@ def main() -> None:
 
         try:
             print(f"[INVENTORY] Iniciando snapshot | connected_seller_id={connected_seller_id} | user_id={user_id}")
+            print(f"[INVENTORY] shipping_rule={INVENTORY_SHIPPING_RULE_VERSION} | prioridade=slow")
             headers = get_headers(connected_seller_id)
 
             item_ids = fetch_item_ids(
