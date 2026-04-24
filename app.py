@@ -1336,6 +1336,7 @@ def build_optimizer_cmd(
     dry_run: bool,
     use_cost: bool,
     csv_path: Path,
+    csv_detailed_path: Path | None = None,
 ) -> list[str]:
     cmd = [
         "python3",
@@ -1347,6 +1348,8 @@ def build_optimizer_cmd(
         "true" if use_cost else "false",
         "--out",
         str(csv_path),
+        "--out-detailed-csv",
+        str(csv_detailed_path or build_detailed_csv_path()),
     ]
     if limit_items and limit_items > 0:
         cmd.extend(["--limit", str(limit_items)])
@@ -2065,6 +2068,7 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
     validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("full_pipeline")
     csv_path = build_csv_path()
+    csv_detailed_path = build_detailed_csv_path()
     run_id = insert_job(
         job_type="full",
         connected_seller_id=connected_seller_id,
