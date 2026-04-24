@@ -2412,7 +2412,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                     <div class="job-list">
                         <div><strong>Histórico recente</strong></div>
-                        <!--<div id="recentJobs">Carregando...</div>-->
+                        <div id="recentJobs">Carregando...</div>
                     </div>
                 </div>
                 <div style="display:flex; flex-direction:column; gap:20px;">
