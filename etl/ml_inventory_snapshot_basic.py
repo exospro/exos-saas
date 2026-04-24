@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from psycopg2.extras import Json, execute_values
 
@@ -28,6 +30,27 @@ MAX_PAGE_SIZE = 100
 DEFAULT_MAX_WORKERS = 5
 DEFAULT_BATCH_SIZE = 50
 INVENTORY_SHIPPING_RULE_VERSION = "slow_priority_v1_debug"
+
+_thread_local = threading.local()
+
+
+def make_http_session(pool_size: int = 20) -> requests.Session:
+    """Cria uma Session com pool maior para chamadas concorrentes."""
+    session = make_http_session(pool_size=max(10, int(args.max_workers) * 4))
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def get_thread_session(pool_size: int = 20) -> requests.Session:
+    """Uma Session por thread evita compartilhar requests.Session entre workers."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = make_http_session(pool_size=pool_size)
+        _thread_local.session = session
+    return session
+
 
 
 def get_headers(connected_seller_id: int) -> dict[str, str]:
@@ -516,13 +539,20 @@ def enrich_item(
         listing_type_id=listing_type_id,
         price=price,
     )
-    fee_effective = fetch_listing_prices(
-        session,
-        headers=headers,
-        category_id=category_id,
-        listing_type_id=listing_type_id,
-        price=effective_price,
-    )
+
+    # Performance: quando preço atual e preço efetivo são iguais, a tarifa é a mesma.
+    # Isso evita uma segunda chamada ao endpoint listing_prices sem alterar a regra.
+    if q2(to_decimal(effective_price)) == q2(to_decimal(price)):
+        fee_effective = fee_regular
+    else:
+        fee_effective = fetch_listing_prices(
+            session,
+            headers=headers,
+            category_id=category_id,
+            listing_type_id=listing_type_id,
+            price=effective_price,
+        )
+
     shipping = fetch_shipping_option(session, headers=headers, item_id=mlb)
 
     enriched = dict(item)
@@ -543,6 +573,45 @@ def enrich_item(
         "promotion": promo,
     }
     return enriched
+
+
+def fetch_and_enrich_item(
+    *,
+    connected_seller_id: int,
+    headers: dict[str, str],
+    item_id: str,
+    pool_size: int,
+) -> dict[str, Any]:
+    """Busca detalhe + tarifas + frete dentro do worker.
+
+    Antes, apenas o detalhe do anúncio era paralelo e o enriquecimento
+    (listing_prices + shipping_options) rodava no loop principal.
+    Isso preserva as regras e paraleliza a parte mais lenta.
+    """
+    session = get_thread_session(pool_size=pool_size)
+    item = fetch_item_detail(
+        session,
+        connected_seller_id=connected_seller_id,
+        headers=headers,
+        item_id=item_id,
+    )
+    return enrich_item(session, headers=headers, item=item)
+
+
+def fetch_variation_detail_threadsafe(
+    *,
+    headers: dict[str, str],
+    item_id: str,
+    variation_id: int | str,
+    pool_size: int,
+) -> dict[str, Any]:
+    session = get_thread_session(pool_size=pool_size)
+    return fetch_variation_detail(
+        session,
+        headers=headers,
+        item_id=item_id,
+        variation_id=variation_id,
+    )
 
 
 def build_rows(
@@ -703,11 +772,11 @@ def build_rows(
         with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
             future_map = {
                 executor.submit(
-                    fetch_variation_detail,
-                    session,
+                    fetch_variation_detail_threadsafe,
                     headers=headers,
                     item_id=mlb,
                     variation_id=variation_id,
+                    pool_size=max(10, int(max_workers) * 4),
                 ): (mlb, variation_id)
                 for mlb, variation_id in pending_lookup
             }
@@ -877,8 +946,15 @@ def main() -> None:
             batch_size = max(1, int(args.batch_size))
 
             with ThreadPoolExecutor(max_workers=max(1, int(args.max_workers))) as executor:
+                pool_size = max(10, int(args.max_workers) * 4)
                 future_map = {
-                    executor.submit(fetch_item_detail, session, connected_seller_id=connected_seller_id, headers=headers, item_id=item_id): item_id
+                    executor.submit(
+                        fetch_and_enrich_item,
+                        connected_seller_id=connected_seller_id,
+                        headers=headers,
+                        item_id=item_id,
+                        pool_size=pool_size,
+                    ): item_id
                     for item_id in item_ids
                 }
 
@@ -886,7 +962,6 @@ def main() -> None:
                     item_id = future_map[future]
                     try:
                         item = future.result()
-                        item = enrich_item(session, headers=headers, item=item)
                         batch_items.append(item)
                     except Exception as exc:
                         print(f"[INVENTORY] falha ao buscar/enriquecer detalhe | idx={idx}/{total_ids} | mlb={item_id} | detalhe={exc}")
