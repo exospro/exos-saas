@@ -2436,7 +2436,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar atualização completa</button>
                         </div>
                         <div class="muted" style="margin-top:5px; line-height:1.5;">
-                            Rodar atualização completa executa todo o processo: atualiza anúncios e fretes, atualiza rebates/campanhas disponíveis e depois roda o optimizer.
+                            Rodar atualização completa executa todo o processo: atualiza anúncios e fretes, atualiza rebates/campanhas disponíveis e depois ativa melhor campanha.
                         </div>
                     </div>
                     <div class="muted" id="jobInfo"></div>
