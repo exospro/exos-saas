@@ -17,7 +17,7 @@ import requests
 from etl.inventory.repository import db_connect
 
 app = FastAPI()
-#...
+#.
 
 ML_CLIENT_ID = os.environ["ML_CLIENT_ID"]
 ML_CLIENT_SECRET = os.environ["ML_CLIENT_SECRET"]
@@ -1016,39 +1016,12 @@ def account_invites_revoke(request: Request, account_id: int, invite_id: int):
     return {"ok": True}
 
 
-
-def ensure_async_job_csv_columns() -> None:
-    """Garante colunas para CSV principal e CSV detalhado."""
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                ALTER TABLE app.async_job
-                ADD COLUMN IF NOT EXISTS csv_detailed_file TEXT,
-                ADD COLUMN IF NOT EXISTS csv_detailed_content TEXT,
-                ADD COLUMN IF NOT EXISTS csv_detailed_bytes BIGINT,
-                ADD COLUMN IF NOT EXISTS csv_detailed_mime_type TEXT
-                """
-            )
-        conn.commit()
-
-
 def get_job_csv_payload(run_id: str) -> dict | None:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT
-                    run_id,
-                    csv_file,
-                    csv_content,
-                    csv_mime_type,
-                    csv_bytes,
-                    csv_detailed_file,
-                    csv_detailed_content,
-                    csv_detailed_mime_type,
-                    csv_detailed_bytes
+                SELECT run_id, csv_file, csv_content, csv_mime_type, csv_bytes
                 FROM app.async_job
                 WHERE run_id = %s
                 """,
@@ -1092,11 +1065,6 @@ def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_las
 def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return CSV_DIR / f"{prefix}_{timestamp}.csv"
-
-
-def build_detailed_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return CSV_DIR / f"{prefix}_{timestamp}_detalhado.csv"
 
 
 def build_log_path(prefix: str = "pipeline_run") -> Path:
@@ -1165,7 +1133,6 @@ def get_connected_seller_summary(connected_seller_id: int) -> dict:
 
 
 def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -1173,9 +1140,7 @@ def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
                 SELECT
                     run_id, job_type, status, step, connected_seller_id,
                     limit_items, dry_run, use_cost, log_file, csv_file,
-                    csv_detailed_file,
                     (csv_content IS NOT NULL) AS has_csv,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
                     error, created_at, started_at, finished_at, updated_at,
                     payload_json, result_json
                 FROM app.async_job
@@ -1200,9 +1165,7 @@ def insert_job(
     payload: dict,
     log_file: str | None,
     csv_file: str | None,
-    csv_detailed_file: str | None = None,
 ) -> str:
-    ensure_async_job_csv_columns()
     active_job = get_active_job_for_seller(connected_seller_id)
     if active_job:
         raise HTTPException(
@@ -1233,12 +1196,11 @@ def insert_job(
                     payload_json,
                     log_file,
                     csv_file,
-                    csv_detailed_file,
                     result_json,
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, 'queued', NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                VALUES (%s, %s, 'queued', NULL, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
                 """,
                 (
                     run_id,
@@ -1250,7 +1212,6 @@ def insert_job(
                     Json(payload),
                     log_file,
                     csv_file,
-                    csv_detailed_file,
                     Json({}),
                 ),
             )
@@ -1259,7 +1220,6 @@ def insert_job(
 
 
 def get_job(run_id: str) -> dict:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -1277,9 +1237,7 @@ def get_job(run_id: str) -> dict:
                     result_json,
                     log_file,
                     csv_file,
-                    csv_detailed_file,
                     (csv_content IS NOT NULL) AS has_csv,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
                     error,
                     created_at,
                     started_at,
@@ -1336,7 +1294,6 @@ def build_optimizer_cmd(
     dry_run: bool,
     use_cost: bool,
     csv_path: Path,
-    csv_detailed_path: Path | None = None,
 ) -> list[str]:
     cmd = [
         "python3",
@@ -1348,8 +1305,6 @@ def build_optimizer_cmd(
         "true" if use_cost else "false",
         "--out",
         str(csv_path),
-        "--out-detailed",
-        str(csv_detailed_path or build_detailed_csv_path()),
     ]
     if limit_items and limit_items > 0:
         cmd.extend(["--limit", str(limit_items)])
@@ -1513,29 +1468,12 @@ def build_job_summary(job: dict) -> dict:
 
 def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) -> list[dict]:
     sql = """
-        SELECT
-            run_id,
-            job_type,
-            status,
-            step,
-            connected_seller_id,
-            limit_items,
-            dry_run,
-            use_cost,
-            payload_json,
-            result_json,
-            log_file,
-            csv_file,
-            csv_detailed_file,
-            (csv_content IS NOT NULL) AS has_csv,
-            (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
-            error,
-            created_at,
-            started_at,
-            finished_at,
-            updated_at
-        FROM app.async_job
-        """
+    SELECT
+        run_id, job_type, status, step, connected_seller_id,
+        limit_items, dry_run, use_cost, payload_json, result_json,
+        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv, error, created_at, started_at, finished_at, updated_at
+    FROM app.async_job
+    """
     params = []
     if connected_seller_id is not None:
         sql += " WHERE connected_seller_id = %s"
@@ -1944,42 +1882,13 @@ def run_rebate(request: Request, connected_seller_id: int = 1, limit: int = 0):
     }
 
 
-
-@app.get("/download/csv_detailed")
-def download_csv_detailed(request: Request, filename: str | None = None, run_id: str | None = None):
-    user = require_user(request)
-    if run_id:
-        require_run_access(int(user["id"]), run_id)
-
-    if filename:
-        file_path = CSV_DIR / filename
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(path=str(file_path), filename=filename, media_type="text/csv")
-
-    if run_id:
-        payload = get_job_csv_payload(run_id)
-        if not payload:
-            raise HTTPException(status_code=404, detail="run_id não encontrado")
-
-        csv_content = payload.get("csv_detailed_content")
-        csv_file = payload.get("csv_detailed_file") or "resultado_detalhado.csv"
-        mime = payload.get("csv_detailed_mime_type") or "text/csv"
-
-        if csv_content:
-            headers = {"Content-Disposition": f'attachment; filename="{csv_file}"'}
-            return PlainTextResponse(csv_content, media_type=mime, headers=headers)
-
-    raise HTTPException(status_code=404, detail="CSV detalhado não encontrado")
-
-
 @app.get("/run/optimizer")
 def run_optimizer(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
     user = require_user(request)
     require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
-    cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
+    cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return {
         "status": "optimizer executado",
@@ -2007,8 +1916,7 @@ def run_full(request: Request, connected_seller_id: int = 1, limit: int = 0, dry
     r2 = subprocess.run(build_rebate_cmd(connected_seller_id, limit), capture_output=True, text=True)
     results["rebate"] = r2.stdout or r2.stderr
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
-    r3 = subprocess.run(build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path), capture_output=True, text=True)
+    r3 = subprocess.run(build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path), capture_output=True, text=True)
     results["optimizer"] = r3.stdout or r3.stderr
     return {
         "status": "full run executado",
@@ -2081,17 +1989,15 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
     validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("optimizer_run")
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
     run_id = insert_job(
         job_type="optimizer",
         connected_seller_id=connected_seller_id,
         limit_items=limit,
         dry_run=dry_run,
         use_cost=use_cost,
-        payload={"cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)},
+        payload={"cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path)},
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
     register_daily_execution(account_id)
     return async_ok_response(
@@ -2103,7 +2009,6 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         use_cost=use_cost,
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
 
 
@@ -2115,7 +2020,6 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
     validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("full_pipeline")
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
     run_id = insert_job(
         job_type="full",
         connected_seller_id=connected_seller_id,
@@ -2125,11 +2029,10 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
         payload={
             "inventory_cmd": build_inventory_cmd(connected_seller_id, limit),
             "rebate_cmd": build_rebate_cmd(connected_seller_id, limit),
-            "optimizer_cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path),
+            "optimizer_cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path),
         },
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
     register_daily_execution(account_id)
     return async_ok_response(
@@ -2141,7 +2044,6 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
         use_cost=use_cost,
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
 
 
@@ -2631,39 +2533,17 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             function setOutput(text) {{ const el = document.getElementById("output"); if (el) el.innerText = text || ""; }}
             function setJobInfo(text) {{ const el = document.getElementById("jobInfo"); if (el) el.innerText = text || ""; }}
 
-            function setDownloads(csvFile, csvDetailedFile, runId, hasCsv, hasCsvDetailed, status) {{
-                const el = document.getElementById("downloadArea");
-                if (!el) return;
+            function setDownloads(csvFile, runId, hasCsv, statusValue) {{
+                const area = document.getElementById("downloadArea");
+                const csvLink = document.getElementById("downloadCsvLink");
+                let show = false;
 
-                if (!runId || status !== "finished") {{
-                    el.innerHTML = "";
-                    return;
-                }}
-
-                const buttons = [];
-
-                if (hasCsv || csvFile) {{
-                    buttons.push(`
-                        <a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(runId)}}">
-                            <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">
-                                CSV
-                            </button>
-                        </a>
-                    `);
-                }}
-
-                if (hasCsvDetailed || csvDetailedFile) {{
-                    buttons.push(`
-                        <a target="_blank" href="/download/csv_detailed?run_id=${{encodeURIComponent(runId)}}">
-                            <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">
-                                CSV Detalhado
-                            </button>
-                        </a>
-                    `);
-                }}
-
-                el.innerHTML = buttons.join(" ");
-            }} else {{
+                const finished = statusValue === "finished";
+                if (finished && hasCsv && runId) {{
+                    csvLink.href = `/download/csv?run_id=${{encodeURIComponent(runId)}}`;
+                    csvLink.style.display = "inline-block";
+                    show = true;
+                }} else {{
                     csvLink.style.display = "none";
                     csvLink.href = "#";
                 }}
@@ -2807,18 +2687,9 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>
                             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
-                                <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">Status</button></a>
-                                <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">Log</button></a>
-                                ${{j.has_csv ? `
-                                    <a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">CSV</button></a>` : ''}}
-
-                                ${{j.has_csv_detailed ? `
-                                    <a target="_blank" href="/download/csv_detailed?run_id=${{encodeURIComponent(j.run_id)}}">
-                                        <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">
-                                            CSV Detalhado
-                                        </button>
-                                    </a>
-                                ` : ''}}
+                                <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
+                                <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
+                                ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
@@ -2849,7 +2720,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     const stageMsg = jobStageMessage(status);
                     setOutput(logText || stageMsg || JSON.stringify(status, null, 2));
                     setJobInfo("");
-                    setDownloads(status.csv_file, status.csv_detailed_file, status.run_id, status.has_csv, status.has_csv_detailed, status.status);
+                    setDownloads(status.csv_file, status.run_id, status.has_csv, status.status);
                     setSummary(status.summary || {{ headline: stageMsg, metrics: {{}} }});
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
