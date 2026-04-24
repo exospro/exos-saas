@@ -2741,20 +2741,22 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             refreshRecentJobs();
             refreshInvites();
             refreshMinReceive();
-
+        
+function renderActiveJobWarn(data) {{
+  const el = document.getElementById('activeJobWarn');
   if(!el) return;
   let msg = "⚠️ Já existe uma atualização em andamento. Aguarde a conclusão antes de iniciar outra.";
-  try{
+  try {{
     const st = data?.status || data?.detail?.status;
-    if(st === 'queued'){
+    if(st === 'queued') {{
       msg = "⏳ Sua solicitação está na fila. Em breve será iniciada.";
-    } else if(st === 'running'){
+    }} else if(st === 'running') {{
       msg = "🔄 Estamos processando sua otimização agora. Aguarde a conclusão.";
-    }
-  }catch(e){}
+    }}
+  }} catch(e) {{}}
   el.innerText = msg;
   el.style.display = 'block';
-}
+}}
 
 </script>
     </body>
