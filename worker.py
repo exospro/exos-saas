@@ -20,6 +20,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 POLL_INTERVAL_SEC = float(os.environ.get("ASYNC_JOB_POLL_INTERVAL_SEC", "5"))
 WORKER_NAME = os.environ.get("ASYNC_JOB_WORKER_NAME", "worker-1")
 KEEP_LAST_FINISHED_JOBS_PER_SELLER = int(os.environ.get("ASYNC_JOB_KEEP_LAST_FINISHED", "1"))
+STALE_RUNNING_JOB_MINUTES = int(os.environ.get("ASYNC_JOB_STALE_RUNNING_MINUTES", "30"))
 
 
 def append_log(log_path: Path, message: str) -> None:
@@ -78,6 +79,40 @@ def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_las
             deleted = cur.rowcount
         conn.commit()
     return deleted
+
+
+def mark_stale_running_jobs_as_error(minutes: int = STALE_RUNNING_JOB_MINUTES) -> int:
+    """
+    Libera jobs que ficaram presos em running após restart/kill do worker.
+
+    Observação:
+    - Este worker chama essa rotina antes de tentar pegar novo job.
+    - Em operação normal, enquanto o próprio worker está executando um subprocesso longo,
+      ele não entra nesse trecho do loop.
+    - Se houver múltiplos workers para o mesmo banco, mantenha o timeout alto o suficiente.
+    """
+    if minutes <= 0:
+        return 0
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE app.async_job
+                   SET status = 'error',
+                       error = COALESCE(error, 'Job interrompido ou travado por timeout do worker'),
+                       finished_at = COALESCE(finished_at, now()),
+                       updated_at = now()
+                 WHERE status = 'running'
+                   AND started_at IS NOT NULL
+                   AND updated_at < now() - (%s || ' minutes')::interval
+                """,
+                (minutes,),
+            )
+            count = cur.rowcount
+        conn.commit()
+
+    return int(count or 0)
 
 
 def claim_next_job() -> dict | None:
@@ -286,11 +321,15 @@ def run_single_job(job: dict) -> None:
 
 def main() -> None:
     print(
-        f"[WORKER] iniciado | nome={WORKER_NAME} | poll_interval={POLL_INTERVAL_SEC}s | keep_last_finished={KEEP_LAST_FINISHED_JOBS_PER_SELLER}",
+        f"[WORKER] iniciado | nome={WORKER_NAME} | poll_interval={POLL_INTERVAL_SEC}s | keep_last_finished={KEEP_LAST_FINISHED_JOBS_PER_SELLER} | stale_running_minutes={STALE_RUNNING_JOB_MINUTES}",
         flush=True,
     )
     while True:
         try:
+            stale_count = mark_stale_running_jobs_as_error()
+            if stale_count:
+                print(f"[WORKER] jobs running travados marcados como error: {stale_count}", flush=True)
+
             job = claim_next_job()
             if not job:
                 time.sleep(POLL_INTERVAL_SEC)
