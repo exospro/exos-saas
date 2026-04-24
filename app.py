@@ -2439,7 +2439,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             Rodar atualização completa executa todo o processo: atualiza anúncios e fretes, atualiza rebates/campanhas disponíveis e depois ativa melhor campanha.
                         </div>
                     </div>
-                    <div class="muted" id="jobInfo"></div>
+                    <!--<div class="muted" id="jobInfo"></div>-->
                     <div class="summary-card">
                         <div class="summary-title">Resumo geral</div>
                         <div class="summary-headline" id="summaryHeadline">Nenhum job executado ainda.</div>
@@ -2681,8 +2681,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                                 <div>${{j.step || '-'}}</div>
                             </div>
                             <div style="margin-top:6px">${{j.summary?.headline || ''}}</div>
-                            <div style="margin-top:6px; color:#9fb0d9">run_id=${{j.run_id}}</div>
-                            <div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>
+                            <!--<div style="margin-top:6px; color:#9fb0d9">run_id=${{j.run_id}}</div>-->
+                            <!--<div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>-->
                             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
@@ -2741,7 +2741,24 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             refreshRecentJobs();
             refreshInvites();
             refreshMinReceive();
-        </script>
+        
+function renderActiveJobWarn(data){
+  const el = document.getElementById('activeJobWarn');
+  if(!el) return;
+  let msg = "⚠️ Já existe uma atualização em andamento. Aguarde a conclusão antes de iniciar outra.";
+  try{
+    const st = data?.status || data?.detail?.status;
+    if(st === 'queued'){
+      msg = "⏳ Sua solicitação está na fila. Em breve será iniciada.";
+    } else if(st === 'running'){
+      msg = "🔄 Estamos processando sua otimização agora. Aguarde a conclusão.";
+    }
+  }catch(e){}
+  el.innerText = msg;
+  el.style.display = 'block';
+}
+
+</script>
     </body>
     </html>
     """
