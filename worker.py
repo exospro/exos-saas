@@ -233,7 +233,19 @@ def run_single_job(job: dict) -> None:
             finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=None)
 
         elif job_type == "optimizer":
-            update_job(run_id, step="optimizer")
+            # Novo fluxo do botão "Aplicar melhor campanha":
+            # primeiro atualiza rebates/campanhas disponíveis, depois roda o optimizer.
+            if payload.get("rebate_cmd"):
+                update_job(run_id, step="rebate", result_json=result_json)
+                append_log(log_path, "[PIPELINE] Optimizer - Etapa 1/2 - Rebate: iniciando")
+                r1 = run_command(payload["rebate_cmd"], log_path, "REBATE")
+                result_json["rebate"] = r1
+                update_job(run_id, step="rebate", result_json=result_json)
+                if r1["returncode"] != 0:
+                    raise RuntimeError("Rebate falhou")
+
+            update_job(run_id, step="optimizer", result_json=result_json)
+            append_log(log_path, "[PIPELINE] Optimizer - Etapa 2/2 - Optimizer: iniciando")
             result = run_command(payload["cmd"], log_path, "OPTIMIZER")
             result_json["optimizer"] = result
             if result["returncode"] != 0:

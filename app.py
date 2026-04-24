@@ -1,19 +1,18 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
 import os
-import csv
-import io
 import re
 import time
 import subprocess
+import csv
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, quote
 import secrets
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import Json, RealDictCursor, execute_values
 
 import requests
-import openpyxl
 
 from etl.inventory.repository import db_connect
 
@@ -46,6 +45,11 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
+
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
 
 
 
@@ -362,7 +366,6 @@ def register_daily_execution(account_id: int) -> dict:
 
 
 
-
 def ensure_account_sku_min_receive_table() -> None:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -370,159 +373,87 @@ def ensure_account_sku_min_receive_table() -> None:
                 """
                 CREATE SCHEMA IF NOT EXISTS app;
                 CREATE TABLE IF NOT EXISTS app.account_sku_min_receive (
+                    id BIGSERIAL PRIMARY KEY,
                     account_id BIGINT NOT NULL,
                     sku TEXT NOT NULL,
-                    min_receive_classico NUMERIC(18,2),
-                    min_receive_premium NUMERIC(18,2),
+                    vlr_min_receber NUMERIC(18,2) NOT NULL,
                     source_file_name TEXT,
                     uploaded_by_user_id BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (account_id, sku)
+                    UNIQUE (account_id, sku)
                 );
-                CREATE INDEX IF NOT EXISTS ix_account_sku_min_receive_account_id
+                CREATE INDEX IF NOT EXISTS idx_account_sku_min_receive_account
                 ON app.account_sku_min_receive (account_id);
-                CREATE INDEX IF NOT EXISTS ix_account_sku_min_receive_sku
-                ON app.account_sku_min_receive (sku);
-                """
-            )
-            cur.execute(
-                """
-                ALTER TABLE app.account_sku_min_receive
-                    ADD COLUMN IF NOT EXISTS min_receive_classico NUMERIC(18,2),
-                    ADD COLUMN IF NOT EXISTS min_receive_premium NUMERIC(18,2),
-                    ADD COLUMN IF NOT EXISTS source_file_name TEXT,
-                    ADD COLUMN IF NOT EXISTS uploaded_by_user_id BIGINT,
-                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                """
-            )
-            cur.execute(
-                """
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1
-                        FROM information_schema.columns
-                        WHERE table_schema = 'app'
-                          AND table_name = 'account_sku_min_receive'
-                          AND column_name = 'vlr_min_receber'
-                    ) THEN
-                        UPDATE app.account_sku_min_receive
-                        SET
-                            min_receive_classico = COALESCE(min_receive_classico, vlr_min_receber),
-                            min_receive_premium = COALESCE(min_receive_premium, vlr_min_receber)
-                        WHERE vlr_min_receber IS NOT NULL;
-                    END IF;
-                END $$;
                 """
             )
         conn.commit()
 
 
-def parse_decimal_nullable(value) -> float | None:
-    text = str(value or "").strip()
+def parse_decimal_br(value) -> float:
+    text = str(value or '').strip()
     if not text:
-        return None
-    text = text.replace("R$", "").replace("$", "").strip()
-    if "," in text:
-        text = text.replace(".", "").replace(",", ".")
-    return round(float(text), 2)
+        raise ValueError('Valor vazio')
+    if ',' in text:
+        text = text.replace('.', '').replace(',', '.')
+    return float(text)
 
 
-def parse_min_receive_file_v2(filename: str, content: bytes) -> list[tuple[str, float | None, float | None]]:
-    name = (filename or "").lower()
-    rows: list[tuple[str, float | None, float | None]] = []
+def parse_min_receive_file(filename: str, content: bytes) -> list[tuple[str, float]]:
+    name = (filename or '').lower()
+    rows: list[tuple[str, float]] = []
 
-    def normalize_header_map(fieldnames: list[str] | None) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for raw in fieldnames or []:
-            if raw is None:
-                continue
-            original = str(raw)
-            key = original.strip().lower()
-            out[key] = original
-        return out
-
-    def required_indexes(fields: dict[str, str]) -> tuple[str, str, str]:
-        sku_col = fields.get("sku")
-        classico_col = fields.get("$_classico") or fields.get("min_receive_classico") or fields.get("vlr_classico")
-        premium_col = fields.get("$_premium") or fields.get("min_receive_premium") or fields.get("vlr_premium")
-        if not sku_col or not classico_col or not premium_col:
-            raise HTTPException(
-                status_code=400,
-                detail="O arquivo deve conter as colunas SKU, $_CLASSICO e $_PREMIUM."
-            )
-        return sku_col, classico_col, premium_col
-
-    if name.endswith(".csv"):
-        decoded = content.decode("utf-8-sig")
+    if name.endswith('.csv'):
+        decoded = content.decode('utf-8-sig')
         sample = decoded[:4096]
-        delim = ";" if sample.count(";") >= sample.count(",") else ","
+        delim = ';' if sample.count(';') >= sample.count(',') else ','
         reader = csv.DictReader(decoded.splitlines(), delimiter=delim)
-        fields = normalize_header_map(reader.fieldnames)
-        sku_col, classico_col, premium_col = required_indexes(fields)
-        latest_by_sku: dict[str, tuple[float | None, float | None]] = {}
+        fields = {str(f).strip().lower(): f for f in (reader.fieldnames or [])}
+        if 'sku' not in fields or 'vlr_min_receber' not in fields:
+            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
         for row in reader:
-            sku = str(row.get(sku_col) or "").strip()
+            sku = str(row.get(fields['sku']) or '').strip()
             if not sku:
                 continue
-            latest_by_sku[sku] = (
-                parse_decimal_nullable(row.get(classico_col)),
-                parse_decimal_nullable(row.get(premium_col)),
-            )
-        return [(sku, vals[0], vals[1]) for sku, vals in sorted(latest_by_sku.items())]
+            rows.append((sku, parse_decimal_br(row.get(fields['vlr_min_receber']))))
+        return rows
 
-    if name.endswith(".xlsx"):
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+    if name.endswith('.xlsx'):
+        if openpyxl is None:
+            raise HTTPException(status_code=500, detail='Suporte a XLSX não disponível. Adicione openpyxl ao requirements.txt.')
+        wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
         ws = wb.active
-        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        fields = normalize_header_map([str(v or "") for v in (header_row or [])])
-        sku_col, classico_col, premium_col = required_indexes(fields)
-        headers = [str(v or "") for v in (header_row or [])]
-        idx_sku = headers.index(sku_col)
-        idx_classico = headers.index(classico_col)
-        idx_premium = headers.index(premium_col)
-        latest_by_sku: dict[str, tuple[float | None, float | None]] = {}
+        header = [str(c.value or '').strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        if 'sku' not in header or 'vlr_min_receber' not in header:
+            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
+        idx_sku = header.index('sku')
+        idx_val = header.index('vlr_min_receber')
         for row in ws.iter_rows(min_row=2, values_only=True):
-            sku = str(row[idx_sku] or "").strip()
+            sku = str(row[idx_sku] or '').strip()
             if not sku:
                 continue
-            latest_by_sku[sku] = (
-                parse_decimal_nullable(row[idx_classico]),
-                parse_decimal_nullable(row[idx_premium]),
-            )
-        return [(sku, vals[0], vals[1]) for sku, vals in sorted(latest_by_sku.items())]
+            rows.append((sku, parse_decimal_br(row[idx_val])))
+        return rows
 
-    raise HTTPException(status_code=400, detail="Formato inválido. Envie um arquivo .csv ou .xlsx.")
+    raise HTTPException(status_code=400, detail='Formato inválido. Envie um arquivo .csv ou .xlsx.')
 
 
-def replace_account_min_receive_v2(
-    account_id: int,
-    uploaded_by_user_id: int,
-    filename: str,
-    rows: list[tuple[str, float | None, float | None]],
-) -> int:
+def replace_account_min_receive(account_id: int, uploaded_by_user_id: int, filename: str, rows: list[tuple[str, float]]) -> int:
     ensure_account_sku_min_receive_table()
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
-            for sku, val_classico, val_premium in rows:
-                cur.execute(
+            cur.execute('DELETE FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
+            if rows:
+                execute_values(
+                    cur,
                     """
                     INSERT INTO app.account_sku_min_receive (
-                        account_id,
-                        sku,
-                        min_receive_classico,
-                        min_receive_premium,
-                        source_file_name,
-                        uploaded_by_user_id,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                        account_id, sku, vlr_min_receber, source_file_name, uploaded_by_user_id, created_at, updated_at
+                    ) VALUES %s
                     """,
-                    (account_id, sku, val_classico, val_premium, filename, uploaded_by_user_id),
+                    [(account_id, sku, value, filename, uploaded_by_user_id) for sku, value in rows],
+                    template='(%s,%s,%s,%s,%s,now(),now())',
+                    page_size=500,
                 )
         conn.commit()
     return len(rows)
@@ -534,12 +465,7 @@ def list_account_min_receive(account_id: int, limit: int = 50) -> list[dict]:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT
-                    sku,
-                    min_receive_classico,
-                    min_receive_premium,
-                    source_file_name,
-                    updated_at
+                SELECT sku, vlr_min_receber, source_file_name, updated_at
                 FROM app.account_sku_min_receive
                 WHERE account_id = %s
                 ORDER BY updated_at DESC, sku
@@ -555,7 +481,7 @@ def count_account_min_receive(account_id: int) -> int:
     ensure_account_sku_min_receive_table()
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
+            cur.execute('SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
             return int(cur.fetchone()[0] or 0)
 
 
@@ -934,10 +860,6 @@ def render_login_page(error_message: str = "") -> str:
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         
-.card.compact {{
-    padding: 16px;
-    min-height: unset;
-}}
 </style>
     </head>
     <body>
@@ -1020,10 +942,6 @@ def onboarding_page(request: Request):
           color: #64748b;
         }}
       
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
 </style>
     </head>
     <body>
@@ -1469,7 +1387,20 @@ def build_job_summary(job: dict) -> dict:
         return summary
 
     if status == "running":
-        summary["headline"] = f"Executando job de {job_type}."
+        if job_type == "optimizer" and step == "rebate":
+            summary["headline"] = "Atualizando rebates e campanhas disponíveis."
+        elif job_type == "optimizer" and step == "optimizer":
+            summary["headline"] = "Rodando optimizer e comparando campanhas."
+        elif job_type == "inventory":
+            summary["headline"] = "Atualizando anúncios, tarifas e fretes."
+        elif job_type == "full" and step == "inventory":
+            summary["headline"] = "Atualizando anúncios, tarifas e fretes."
+        elif job_type == "full" and step == "rebate":
+            summary["headline"] = "Atualizando rebates e campanhas disponíveis."
+        elif job_type == "full" and step == "optimizer":
+            summary["headline"] = "Rodando optimizer e comparando campanhas."
+        else:
+            summary["headline"] = f"Executando job de {job_type}."
         if step:
             summary["details"].append(f"Etapa atual: {step}")
         return summary
@@ -1594,63 +1525,6 @@ def get_latest_inventory_item_count(connected_seller_id: int) -> int | None:
     return int(value) if value is not None else None
 
 
-
-
-def get_latest_inventory_mlb_stats(connected_seller_id: int) -> dict:
-    with db_connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                WITH latest_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT
-                    count(DISTINCT i.mlb) AS total_mlbs,
-                    count(DISTINCT CASE WHEN i.status = 'active' THEN i.mlb END) AS active_mlbs,
-                    count(DISTINCT CASE WHEN i.status = 'paused' THEN i.mlb END) AS paused_mlbs
-                FROM ml.inventory_snapshot_item i
-                JOIN latest_run lr
-                  ON lr.run_id = i.run_id
-                WHERE i.connected_seller_id = %s
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            row = cur.fetchone() or {}
-    return {
-        "total_mlbs": int(row.get("total_mlbs") or 0),
-        "active_mlbs": int(row.get("active_mlbs") or 0),
-        "paused_mlbs": int(row.get("paused_mlbs") or 0),
-    }
-
-
-
-
-def get_latest_inventory_unique_skus(connected_seller_id: int) -> list[str]:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH latest_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT DISTINCT trim(i.sku) AS sku
-                FROM ml.inventory_snapshot_item i
-                JOIN latest_run lr
-                  ON lr.run_id = i.run_id
-                WHERE i.connected_seller_id = %s
-                  AND i.sku IS NOT NULL
-                  AND trim(i.sku) <> ''
-                ORDER BY trim(i.sku)
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            rows = cur.fetchall()
-    return [str(r[0]) for r in rows if r and r[0]]
-
 def badge(status: str | None) -> str:
     status = (status or "").lower()
 
@@ -1674,6 +1548,32 @@ def badge(status: str | None) -> str:
 def root(request: Request):
     user = get_session_user(request)
     return RedirectResponse(url="/painel" if user else "/login")
+
+
+@app.get("/template/sku-min-receber.csv")
+def download_template_min_receive_csv(request: Request):
+    require_user(request)
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
+    return PlainTextResponse("sku;vlr_min_receber\nSKU-EXEMPLO-1;120,00\nSKU-EXEMPLO-2;95,50\n", media_type="text/csv", headers=headers)
+
+
+@app.get("/account/min-receive")
+def account_min_receive_list(request: Request, account_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
+    return {"count": count_account_min_receive(account_id), "rows": list_account_min_receive(account_id, 50)}
+
+
+@app.post("/account/min-receive/upload")
+async def account_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin"))
+    content = await file.read()
+    rows = parse_min_receive_file(file.filename or '', content)
+    if not rows:
+        raise HTTPException(status_code=400, detail='Nenhum registro válido encontrado no arquivo.')
+    saved = replace_account_min_receive(account_id, int(user['id']), file.filename or 'upload', rows)
+    return {"ok": True, "rows_saved": saved}
 
 
 @app.get("/health")
@@ -1941,52 +1841,6 @@ def auth_google_callback(request: Request):
     response.delete_cookie("post_login_redirect")
 
     return response
-
-
-@app.get("/template/sku-min-receber.csv")
-def download_template_min_receive_csv(request: Request, connected_seller_id: int):
-    user = require_user(request)
-    require_connected_seller_access(int(user["id"]), connected_seller_id)
-
-    skus = get_latest_inventory_unique_skus(connected_seller_id)
-
-    if not skus:
-        raise HTTPException(status_code=404, detail="Nenhum SKU encontrado.")
-
-    lines = ["SKU;$_CLASSICO;$_PREMIUM"]
-
-    for sku in skus:
-        lines.append(f"{sku};;")
-
-    content = "\n".join(lines) + "\n"
-
-    return PlainTextResponse(
-        content,
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": 'attachment; filename="template_sku_minimo.csv"'
-        },
-    )
-
-
-@app.get("/account/min-receive")
-def account_min_receive_list(request: Request, account_id: int):
-    user = require_user(request)
-    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
-    return {"count": count_account_min_receive(account_id), "rows": list_account_min_receive(account_id, 50)}
-
-
-@app.post("/account/min-receive/upload")
-async def account_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
-    user = require_user(request)
-    require_account_role(int(user["id"]), account_id, ("owner", "admin"))
-    content = await file.read()
-    rows = parse_min_receive_file_v2(file.filename or "", content)
-    if not rows:
-        raise HTTPException(status_code=400, detail="Nenhum registro válido encontrado no arquivo.")
-    saved = replace_account_min_receive_v2(account_id, int(user["id"]), file.filename or "upload", rows)
-    return {"ok": True, "rows_saved": saved}
-
 
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
@@ -2328,9 +2182,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     limit_label = "Todos os anúncios"
 
     inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
-    mlb_stats = get_latest_inventory_mlb_stats(connected_seller_id)
-    latest_inventory_skus = get_latest_inventory_unique_skus(connected_seller_id)
-    can_download_min_receive_template = len(latest_inventory_skus) > 0
     inventory_plan_warning = ""
 
     if subscription:
@@ -2466,7 +2317,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .summary-headline {{ font-size: 16px; color: #e8eeff; }}
             .metrics {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; }}
             .metric {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 14px; padding: 12px; }}
-            .metrics.metrics-3 {{ grid-template-columns: repeat(3, 1fr); }}
             .metric-label {{ font-size: 12px; color: #9fb0d9; margin-bottom: 4px; }}
             .metric-value {{ font-size: 22px; font-weight: 800; }}
             .warn-box {{ display:none; margin-top: 10px; padding: 12px 14px; border-radius: 12px; background: rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.28); color:#fde68a; }}
@@ -2523,60 +2373,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-item {{ padding: 10px 12px; border-radius: 12px; background: rgba(2,8,23,0.55); margin-bottom: 8px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center; }}
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
+            .card.compact {{ padding: 18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
-            @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .metrics.metrics-3 {{ grid-template-columns: 1fr; }} .hero h1 {{ font-size: 40px; }} }}
-            .card.compact {{
-                padding: 18px;
-            }}
-
-            /* Linha do título */
-            .sku-header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-
-            /* Botões menores */
-            .btn-small {{
-                width: auto;
-                padding: 8px 14px;
-                font-size: 13px;
-                border-radius: 10px;
-            }}
-
-            /* Linha de upload */
-            .sku-actions {{
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                margin-top: 12px;
-            }}
-
-            /* Input ocupa espaço */
-            .sku-file {{
-                flex: 1;
-                font-size: 13px;
-            }}
-
-            /* Mobile */
-            @media (max-width: 980px) {{
-                .sku-header {{
-                    flex-direction: column;
-                    align-items: flex-start;
-                    gap: 8px;
-                }}
-
-                .sku-actions {{
-                    flex-direction: column;
-                    align-items: stretch;
-                }}
-
-                .sku-file,
-                .btn-small {{
-                    width: 100%;
-                }}
-            }}
-
+            @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
+            .card.compact {{padding: 16px;min-height: unset;}}
 </style>
     </head>
     <body>
@@ -2615,33 +2415,12 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div id="recentJobs">Carregando...</div>
                     </div>
                 </div>
+                <div style="display:flex; flex-direction:column; gap:20px;">
                 <div class="card">
                     <h2>Executar otimização</h2>
                     <div class="form-row">
                         <label>Conta ativa</label>
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
-                        <div class="card compact" style="margin-top:20px;">
-
-                            <div class="sku-header">
-                                <h2>SKU mínimo</h2>
-
-                                {"<a href=\"/template/sku-min-receber.csv?connected_seller_id=%s\" target=\"_blank\" class=\"button-link\">\n                                    <button class=\"btn btn-secondary btn-small\" type=\"button\">\n                                        Baixar template\n                                    </button>\n                                </a>" % connected_seller_id if can_download_min_receive_template else ""}
-                            </div>
-
-                            <div class="muted">Upload de SKU x valor mínimo a receber</div>
-
-                            <div class="sku-actions">
-                                <input type="file" id="minReceiveFile" accept=".csv,.xlsx" class="sku-file" />
-
-                                <button class="btn btn-primary btn-small" type="button" onclick="uploadMinReceive()">
-                                    Enviar arquivo
-                                </button>
-                            </div>
-
-                            <div class="muted" id="minReceiveInfo" style="margin-top:10px;"></div>
-
-                        </div>
-
                         <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
                     </div>
@@ -2664,16 +2443,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                     <div class="muted" id="jobInfo"></div>
                     <div class="summary-card">
-                        <div class="summary-title">Anúncios mapeados</div>
-                        <div class="summary-headline">Visão do último inventory executado.</div>
-                        <div class="muted">Mostra a quantidade distinta de MLBs totais, ativos e pausados do último snapshot.</div>
-                        <div class="metrics metrics-3">
-                            <div class="metric"><div class="metric-label">MLBs totais</div><div class="metric-value">{mlb_stats["total_mlbs"]}</div></div>
-                            <div class="metric"><div class="metric-label">MLBs ativos</div><div class="metric-value">{mlb_stats["active_mlbs"]}</div></div>
-                            <div class="metric"><div class="metric-label">MLBs pausados</div><div class="metric-value">{mlb_stats["paused_mlbs"]}</div></div>
-                        </div>
-                    </div>
-                    <div class="summary-card">
                         <div class="summary-title">Resumo geral</div>
                         <div class="summary-headline" id="summaryHeadline">Nenhum job executado ainda.</div>
                         <div class="muted" id="summaryDetails"></div>
@@ -2684,6 +2453,26 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="metric"><div class="metric-label">Erros/Falhas</div><div class="metric-value" id="mErrors">-</div></div>
                         </div>
                     </div>
+                </div>
+                <div class="card">
+                    <h2>Valor Mínimo a receber por SKU</h2>
+                    <div class="muted">Baixe o template, preencha <strong>sku</strong> e <strong>vlr_min_receber</strong> e envie o arquivo.</div>
+                    <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                    <div class="actions" style="margin-top:14px;">
+                        <a class="button-link" href="/template/sku-min-receber.csv" target="_blank"><button class="btn btn-secondary" type="button">Baixar template CSV</button></a>
+                    </div>
+                    <div class="invite-row" style="margin-top:14px;">
+                        <div>
+                            <label for="minReceiveFile">Arquivo CSV ou XLSX</label>
+                            <input type="file" id="minReceiveFile" accept=".csv,.xlsx" />
+                        </div>
+                        <div>
+                            <button class="btn btn-primary" style="width:auto; height:40px; padding:0 18px; font-size:14px;" onclick="uploadMinReceive()">Enviar arquivo</button>
+                        </div>
+                    </div>
+                    <div class="muted" id="minReceiveInfo" style="margin-top:12px;">Nenhum arquivo enviado nesta sessão.</div>
+                    <div class="invite-list" id="minReceiveList">Carregando tabela...</div>
+                </div>
                 </div>
             </div>
             <div class="card" style="margin-top:20px;">
@@ -2741,8 +2530,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 return {{ connectedSellerId: document.getElementById("connectedSellerId").value, limit: getLimitValue(), dryRun: document.getElementById("dryrun").checked, useCost: document.getElementById("usecost").checked }};
             }}
 
-            function setOutput(text) {{ document.getElementById("output").innerText = text; }}
-            function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
+            function setOutput(text) {{ const el = document.getElementById("output"); if (el) el.innerText = text || ""; }}
+            function setJobInfo(text) {{ const el = document.getElementById("jobInfo"); if (el) el.innerText = text || ""; }}
 
             function setDownloads(csvFile, runId, hasCsv, statusValue) {{
                 const area = document.getElementById("downloadArea");
@@ -2907,14 +2696,32 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 }} catch (e) {{ document.getElementById("recentJobs").innerText = String(e); }}
             }}
 
+            function jobStageMessage(status) {{
+                if (!status) return "";
+                if (status.status === "queued") return "Job enfileirado, aguardando processamento.";
+                if (status.status === "running") {{
+                    if (status.job_type === "optimizer" && status.step === "rebate") return "Atualizando rebates e campanhas disponíveis...";
+                    if (status.job_type === "optimizer" && status.step === "optimizer") return "Rodando optimizer e comparando campanhas...";
+                    if (status.job_type === "inventory") return "Atualizando anúncios, tarifas e fretes...";
+                    if (status.job_type === "full" && status.step === "inventory") return "Atualizando anúncios, tarifas e fretes...";
+                    if (status.job_type === "full" && status.step === "rebate") return "Atualizando rebates e campanhas disponíveis...";
+                    if (status.job_type === "full" && status.step === "optimizer") return "Rodando optimizer e comparando campanhas...";
+                    return "Processando execução...";
+                }}
+                if (status.status === "finished") return status.summary?.headline || "Execução finalizada.";
+                if (status.status === "error") return status.summary?.headline || "Execução finalizada com erro.";
+                return status.summary?.headline || "";
+            }}
+
             async function pollRun(runId) {{
                 try {{
                     const status = await fetchJson(`/run/status?run_id=${{encodeURIComponent(runId)}}`);
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
-                    setOutput(logText || JSON.stringify(status, null, 2));
-                    setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
+                    const stageMsg = jobStageMessage(status);
+                    setOutput(logText || stageMsg || JSON.stringify(status, null, 2));
+                    setJobInfo("");
                     setDownloads(status.csv_file, status.run_id, status.has_csv, status.status);
-                    setSummary(status.summary);
+                    setSummary(status.summary || {{ headline: stageMsg, metrics: {{}} }});
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
                 }} catch (err) {{ setOutput(String(err)); stopPolling(); }}
@@ -2926,67 +2733,26 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             async function runAsync(url, message) {{
                 stopPolling();
                 setOutput(message);
+                setSummary({{ headline: message, metrics: {{}} }});
                 try {{
                     const data = await fetchJson(url);
-                    setOutput(JSON.stringify(data, null, 2));
-                    setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.run_id || null, false, "queued");
+                    const runId = data.run_id || null;
+                    setOutput(runId ? "Job enfileirado, aguardando processamento." : JSON.stringify(data, null, 2));
+                    setJobInfo("");
+                    setDownloads(data.csv_file || null, runId, false, "queued");
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
-                    if (data.run_id) startPolling(data.run_id);
+                    if (runId) startPolling(runId);
                 }} catch (err) {{
                     setOutput(String(err));
                     await refreshRecentJobs();
                 }}
             }}
 
-
-            async function uploadMinReceive() {{
-                const fileInput = document.getElementById("minReceiveFile");
-                const info = document.getElementById("minReceiveInfo");
-                const accountId = document.getElementById("currentAccountId")?.value;
-
-                if (!fileInput || !fileInput.files || !fileInput.files.length) {{
-                    alert("Selecione um arquivo CSV ou XLSX.");
-                    return;
-                }}
-                if (!accountId) {{
-                    alert("account_id não encontrado na tela.");
-                    return;
-                }}
-
-                const formData = new FormData();
-                formData.append("file", fileInput.files[0]);
-
-                info.innerText = "Enviando arquivo...";
-                try {{
-                    const res = await fetch(`/account/min-receive/upload?account_id=${{encodeURIComponent(accountId)}}`, {{
-                        method: "POST",
-                        body: formData
-                    }});
-                    const text = await res.text();
-                    let data = null;
-                    try {{
-                        data = JSON.parse(text);
-                    }} catch (e) {{
-                        if (!res.ok) throw new Error(text);
-                        throw e;
-                    }}
-                    if (!res.ok) {{
-                        const detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || data);
-                        throw new Error(detail);
-                    }}
-                    info.innerText = `Arquivo enviado com sucesso. ${{data.rows_saved || 0}} SKU(s) salvos.`;
-                    fileInput.value = "";
-                }} catch (e) {{
-                    info.innerText = `Erro no upload: ${{String(e)}}`;
-                }}
-            }}
-
-            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando inventory..."); }}
+            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Atualizando anúncios e fretes..."); }}
             async function rodarRebateAsync() {{ const p = getParams(); await runAsync(`/run/rebate_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando rebate..."); }}
-            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando optimizer..."); }}
-            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando pipeline completa..."); }}
+            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Atualizando rebates e depois rodando optimizer..."); }}
+            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Rodando atualização completa..."); }}
 
             async function logout() {{
                 await fetch("/auth/logout", {{ method: "POST" }});
@@ -2996,6 +2762,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             toggleLimitInput();
             refreshRecentJobs();
             refreshInvites();
+            refreshMinReceive();
         </script>
     </body>
     </html>
