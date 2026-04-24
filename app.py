@@ -1,20 +1,18 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse, Response
+from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
 import os
-import csv
-import json
-import io
 import re
 import time
 import subprocess
+import csv
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode, quote
 import secrets
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import Json, RealDictCursor, execute_values
 
 import requests
-import openpyxl
 
 from etl.inventory.repository import db_connect
 
@@ -48,21 +46,10 @@ ACTIVE_JOB_STATUSES = ("queued", "running")
 
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
 
-
-
-def ensure_async_job_csv_columns() -> None:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                ALTER TABLE app.async_job
-                    ADD COLUMN IF NOT EXISTS csv_detailed_file TEXT,
-                    ADD COLUMN IF NOT EXISTS csv_detailed_content TEXT,
-                    ADD COLUMN IF NOT EXISTS csv_detailed_mime_type TEXT,
-                    ADD COLUMN IF NOT EXISTS csv_detailed_bytes BIGINT
-                """
-            )
-        conn.commit()
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
 
 
 
@@ -379,7 +366,6 @@ def register_daily_execution(account_id: int) -> dict:
 
 
 
-
 def ensure_account_sku_min_receive_table() -> None:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -387,159 +373,87 @@ def ensure_account_sku_min_receive_table() -> None:
                 """
                 CREATE SCHEMA IF NOT EXISTS app;
                 CREATE TABLE IF NOT EXISTS app.account_sku_min_receive (
+                    id BIGSERIAL PRIMARY KEY,
                     account_id BIGINT NOT NULL,
                     sku TEXT NOT NULL,
-                    min_receive_classico NUMERIC(18,2),
-                    min_receive_premium NUMERIC(18,2),
+                    vlr_min_receber NUMERIC(18,2) NOT NULL,
                     source_file_name TEXT,
                     uploaded_by_user_id BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (account_id, sku)
+                    UNIQUE (account_id, sku)
                 );
-                CREATE INDEX IF NOT EXISTS ix_account_sku_min_receive_account_id
+                CREATE INDEX IF NOT EXISTS idx_account_sku_min_receive_account
                 ON app.account_sku_min_receive (account_id);
-                CREATE INDEX IF NOT EXISTS ix_account_sku_min_receive_sku
-                ON app.account_sku_min_receive (sku);
-                """
-            )
-            cur.execute(
-                """
-                ALTER TABLE app.account_sku_min_receive
-                    ADD COLUMN IF NOT EXISTS min_receive_classico NUMERIC(18,2),
-                    ADD COLUMN IF NOT EXISTS min_receive_premium NUMERIC(18,2),
-                    ADD COLUMN IF NOT EXISTS source_file_name TEXT,
-                    ADD COLUMN IF NOT EXISTS uploaded_by_user_id BIGINT,
-                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                """
-            )
-            cur.execute(
-                """
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1
-                        FROM information_schema.columns
-                        WHERE table_schema = 'app'
-                          AND table_name = 'account_sku_min_receive'
-                          AND column_name = 'vlr_min_receber'
-                    ) THEN
-                        UPDATE app.account_sku_min_receive
-                        SET
-                            min_receive_classico = COALESCE(min_receive_classico, vlr_min_receber),
-                            min_receive_premium = COALESCE(min_receive_premium, vlr_min_receber)
-                        WHERE vlr_min_receber IS NOT NULL;
-                    END IF;
-                END $$;
                 """
             )
         conn.commit()
 
 
-def parse_decimal_nullable(value) -> float | None:
-    text = str(value or "").strip()
+def parse_decimal_br(value) -> float:
+    text = str(value or '').strip()
     if not text:
-        return None
-    text = text.replace("R$", "").replace("$", "").strip()
-    if "," in text:
-        text = text.replace(".", "").replace(",", ".")
-    return round(float(text), 2)
+        raise ValueError('Valor vazio')
+    if ',' in text:
+        text = text.replace('.', '').replace(',', '.')
+    return float(text)
 
 
-def parse_min_receive_file_v2(filename: str, content: bytes) -> list[tuple[str, float | None, float | None]]:
-    name = (filename or "").lower()
-    rows: list[tuple[str, float | None, float | None]] = []
+def parse_min_receive_file(filename: str, content: bytes) -> list[tuple[str, float]]:
+    name = (filename or '').lower()
+    rows: list[tuple[str, float]] = []
 
-    def normalize_header_map(fieldnames: list[str] | None) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for raw in fieldnames or []:
-            if raw is None:
-                continue
-            original = str(raw)
-            key = original.strip().lower()
-            out[key] = original
-        return out
-
-    def required_indexes(fields: dict[str, str]) -> tuple[str, str, str]:
-        sku_col = fields.get("sku")
-        classico_col = fields.get("$_classico") or fields.get("min_receive_classico") or fields.get("vlr_classico")
-        premium_col = fields.get("$_premium") or fields.get("min_receive_premium") or fields.get("vlr_premium")
-        if not sku_col or not classico_col or not premium_col:
-            raise HTTPException(
-                status_code=400,
-                detail="O arquivo deve conter as colunas SKU, $_CLASSICO e $_PREMIUM."
-            )
-        return sku_col, classico_col, premium_col
-
-    if name.endswith(".csv"):
-        decoded = content.decode("utf-8-sig")
+    if name.endswith('.csv'):
+        decoded = content.decode('utf-8-sig')
         sample = decoded[:4096]
-        delim = ";" if sample.count(";") >= sample.count(",") else ","
+        delim = ';' if sample.count(';') >= sample.count(',') else ','
         reader = csv.DictReader(decoded.splitlines(), delimiter=delim)
-        fields = normalize_header_map(reader.fieldnames)
-        sku_col, classico_col, premium_col = required_indexes(fields)
-        latest_by_sku: dict[str, tuple[float | None, float | None]] = {}
+        fields = {str(f).strip().lower(): f for f in (reader.fieldnames or [])}
+        if 'sku' not in fields or 'vlr_min_receber' not in fields:
+            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
         for row in reader:
-            sku = str(row.get(sku_col) or "").strip()
+            sku = str(row.get(fields['sku']) or '').strip()
             if not sku:
                 continue
-            latest_by_sku[sku] = (
-                parse_decimal_nullable(row.get(classico_col)),
-                parse_decimal_nullable(row.get(premium_col)),
-            )
-        return [(sku, vals[0], vals[1]) for sku, vals in sorted(latest_by_sku.items())]
+            rows.append((sku, parse_decimal_br(row.get(fields['vlr_min_receber']))))
+        return rows
 
-    if name.endswith(".xlsx"):
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+    if name.endswith('.xlsx'):
+        if openpyxl is None:
+            raise HTTPException(status_code=500, detail='Suporte a XLSX não disponível. Adicione openpyxl ao requirements.txt.')
+        wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
         ws = wb.active
-        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        fields = normalize_header_map([str(v or "") for v in (header_row or [])])
-        sku_col, classico_col, premium_col = required_indexes(fields)
-        headers = [str(v or "") for v in (header_row or [])]
-        idx_sku = headers.index(sku_col)
-        idx_classico = headers.index(classico_col)
-        idx_premium = headers.index(premium_col)
-        latest_by_sku: dict[str, tuple[float | None, float | None]] = {}
+        header = [str(c.value or '').strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        if 'sku' not in header or 'vlr_min_receber' not in header:
+            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
+        idx_sku = header.index('sku')
+        idx_val = header.index('vlr_min_receber')
         for row in ws.iter_rows(min_row=2, values_only=True):
-            sku = str(row[idx_sku] or "").strip()
+            sku = str(row[idx_sku] or '').strip()
             if not sku:
                 continue
-            latest_by_sku[sku] = (
-                parse_decimal_nullable(row[idx_classico]),
-                parse_decimal_nullable(row[idx_premium]),
-            )
-        return [(sku, vals[0], vals[1]) for sku, vals in sorted(latest_by_sku.items())]
+            rows.append((sku, parse_decimal_br(row[idx_val])))
+        return rows
 
-    raise HTTPException(status_code=400, detail="Formato inválido. Envie um arquivo .csv ou .xlsx.")
+    raise HTTPException(status_code=400, detail='Formato inválido. Envie um arquivo .csv ou .xlsx.')
 
 
-def replace_account_min_receive_v2(
-    account_id: int,
-    uploaded_by_user_id: int,
-    filename: str,
-    rows: list[tuple[str, float | None, float | None]],
-) -> int:
+def replace_account_min_receive(account_id: int, uploaded_by_user_id: int, filename: str, rows: list[tuple[str, float]]) -> int:
     ensure_account_sku_min_receive_table()
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
-            for sku, val_classico, val_premium in rows:
-                cur.execute(
+            cur.execute('DELETE FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
+            if rows:
+                execute_values(
+                    cur,
                     """
                     INSERT INTO app.account_sku_min_receive (
-                        account_id,
-                        sku,
-                        min_receive_classico,
-                        min_receive_premium,
-                        source_file_name,
-                        uploaded_by_user_id,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+                        account_id, sku, vlr_min_receber, source_file_name, uploaded_by_user_id, created_at, updated_at
+                    ) VALUES %s
                     """,
-                    (account_id, sku, val_classico, val_premium, filename, uploaded_by_user_id),
+                    [(account_id, sku, value, filename, uploaded_by_user_id) for sku, value in rows],
+                    template='(%s,%s,%s,%s,%s,now(),now())',
+                    page_size=500,
                 )
         conn.commit()
     return len(rows)
@@ -551,12 +465,7 @@ def list_account_min_receive(account_id: int, limit: int = 50) -> list[dict]:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT
-                    sku,
-                    min_receive_classico,
-                    min_receive_premium,
-                    source_file_name,
-                    updated_at
+                SELECT sku, vlr_min_receber, source_file_name, updated_at
                 FROM app.account_sku_min_receive
                 WHERE account_id = %s
                 ORDER BY updated_at DESC, sku
@@ -572,7 +481,7 @@ def count_account_min_receive(account_id: int) -> int:
     ensure_account_sku_min_receive_table()
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s", (account_id,))
+            cur.execute('SELECT count(*) FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
             return int(cur.fetchone()[0] or 0)
 
 
@@ -951,10 +860,6 @@ def render_login_page(error_message: str = "") -> str:
             .login-error {{ margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: rgba(239,68,68,.16); border:1px solid rgba(239,68,68,.28); color:#fecaca; }}
             .muted {{ margin-top:12px; font-size:13px; color:#9fb0d9; }}
         
-.card.compact {{
-    padding: 16px;
-    min-height: unset;
-}}
 </style>
     </head>
     <body>
@@ -1037,10 +942,6 @@ def onboarding_page(request: Request):
           color: #64748b;
         }}
       
-.card.compact {
-    padding: 16px;
-    min-height: unset;
-}
 </style>
     </head>
     <body>
@@ -1116,21 +1017,11 @@ def account_invites_revoke(request: Request, account_id: int, invite_id: int):
 
 
 def get_job_csv_payload(run_id: str) -> dict | None:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT
-                    run_id,
-                    csv_file,
-                    csv_content,
-                    csv_mime_type,
-                    csv_bytes,
-                    csv_detailed_file,
-                    csv_detailed_content,
-                    csv_detailed_mime_type,
-                    csv_detailed_bytes
+                SELECT run_id, csv_file, csv_content, csv_mime_type, csv_bytes
                 FROM app.async_job
                 WHERE run_id = %s
                 """,
@@ -1174,11 +1065,6 @@ def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_las
 def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return CSV_DIR / f"{prefix}_{timestamp}.csv"
-
-
-def build_detailed_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return CSV_DIR / f"{prefix}_{timestamp}_detalhado.csv"
 
 
 def build_log_path(prefix: str = "pipeline_run") -> Path:
@@ -1247,7 +1133,6 @@ def get_connected_seller_summary(connected_seller_id: int) -> dict:
 
 
 def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -1255,9 +1140,7 @@ def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
                 SELECT
                     run_id, job_type, status, step, connected_seller_id,
                     limit_items, dry_run, use_cost, log_file, csv_file,
-                    csv_detailed_file,
                     (csv_content IS NOT NULL) AS has_csv,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
                     error, created_at, started_at, finished_at, updated_at,
                     payload_json, result_json
                 FROM app.async_job
@@ -1282,9 +1165,7 @@ def insert_job(
     payload: dict,
     log_file: str | None,
     csv_file: str | None,
-    csv_detailed_file: str | None,
 ) -> str:
-    ensure_async_job_csv_columns()
     active_job = get_active_job_for_seller(connected_seller_id)
     if active_job:
         raise HTTPException(
@@ -1315,12 +1196,11 @@ def insert_job(
                     payload_json,
                     log_file,
                     csv_file,
-                    csv_detailed_file,
                     result_json,
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, 'queued', NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                VALUES (%s, %s, 'queued', NULL, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
                 """,
                 (
                     run_id,
@@ -1332,7 +1212,6 @@ def insert_job(
                     Json(payload),
                     log_file,
                     csv_file,
-                    csv_detailed_file,
                     Json({}),
                 ),
             )
@@ -1341,7 +1220,6 @@ def insert_job(
 
 
 def get_job(run_id: str) -> dict:
-    ensure_async_job_csv_columns()
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -1359,9 +1237,7 @@ def get_job(run_id: str) -> dict:
                     result_json,
                     log_file,
                     csv_file,
-                    csv_detailed_file,
                     (csv_content IS NOT NULL) AS has_csv,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
                     error,
                     created_at,
                     started_at,
@@ -1418,7 +1294,6 @@ def build_optimizer_cmd(
     dry_run: bool,
     use_cost: bool,
     csv_path: Path,
-    csv_detailed_path: Path | None = None,
 ) -> list[str]:
     cmd = [
         "python3",
@@ -1431,48 +1306,11 @@ def build_optimizer_cmd(
         "--out",
         str(csv_path),
     ]
-    if csv_detailed_path is not None:
-        cmd.extend(["--out-detailed", str(csv_detailed_path)])
     if limit_items and limit_items > 0:
         cmd.extend(["--limit", str(limit_items)])
     if dry_run:
         cmd.append("--dry-run")
     return cmd
-
-
-
-def build_rebate_optimizer_cmd(
-    connected_seller_id: int,
-    limit_items: int,
-    dry_run: bool,
-    use_cost: bool,
-    csv_path: Path,
-    csv_detailed_path: Path | None = None,
-) -> list[str]:
-    """Executa rebate antes do optimizer no mesmo job, sem rodar inventory."""
-    rebate_cmd = build_rebate_cmd(connected_seller_id, limit_items)
-    optimizer_cmd = build_optimizer_cmd(connected_seller_id, limit_items, dry_run, use_cost, csv_path, csv_detailed_path)
-    runner = f"""
-import subprocess
-import sys
-import time
-commands = {json.dumps([rebate_cmd, optimizer_cmd], ensure_ascii=False)}
-labels = ["REBATE", "OPTIMIZER"]
-for label, cmd in zip(labels, commands):
-    started = time.time()
-    print(f"===== {{label}} | iniciando =====", flush=True)
-    print(f"[{{label}}] CMD: {{' '.join(cmd)}}", flush=True)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.stdout:
-        print(result.stdout, end="", flush=True)
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr, flush=True)
-    elapsed = round(time.time() - started, 2)
-    print(f"===== {{label}} | returncode={{result.returncode}} | elapsed_seconds={{elapsed}} =====", flush=True)
-    if result.returncode != 0:
-        sys.exit(result.returncode)
-""".strip()
-    return ["python3", "-c", runner]
 
 
 def parse_optimizer_stats(text: str) -> dict:
@@ -1620,9 +1458,7 @@ def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) ->
     SELECT
         run_id, job_type, status, step, connected_seller_id,
         limit_items, dry_run, use_cost, payload_json, result_json,
-        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv,
-                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
-                    csv_detailed_file, error, created_at, started_at, finished_at, updated_at
+        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv, error, created_at, started_at, finished_at, updated_at
     FROM app.async_job
     """
     params = []
@@ -1676,63 +1512,6 @@ def get_latest_inventory_item_count(connected_seller_id: int) -> int | None:
     return int(value) if value is not None else None
 
 
-
-
-def get_latest_inventory_mlb_stats(connected_seller_id: int) -> dict:
-    with db_connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                WITH latest_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT
-                    count(DISTINCT i.mlb) AS total_mlbs,
-                    count(DISTINCT CASE WHEN i.status = 'active' THEN i.mlb END) AS active_mlbs,
-                    count(DISTINCT CASE WHEN i.status = 'paused' THEN i.mlb END) AS paused_mlbs
-                FROM ml.inventory_snapshot_item i
-                JOIN latest_run lr
-                  ON lr.run_id = i.run_id
-                WHERE i.connected_seller_id = %s
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            row = cur.fetchone() or {}
-    return {
-        "total_mlbs": int(row.get("total_mlbs") or 0),
-        "active_mlbs": int(row.get("active_mlbs") or 0),
-        "paused_mlbs": int(row.get("paused_mlbs") or 0),
-    }
-
-
-
-
-def get_latest_inventory_unique_skus(connected_seller_id: int) -> list[str]:
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH latest_run AS (
-                    SELECT max(run_id) AS run_id
-                    FROM ml.inventory_snapshot_item
-                    WHERE connected_seller_id = %s
-                )
-                SELECT DISTINCT trim(i.sku) AS sku
-                FROM ml.inventory_snapshot_item i
-                JOIN latest_run lr
-                  ON lr.run_id = i.run_id
-                WHERE i.connected_seller_id = %s
-                  AND i.sku IS NOT NULL
-                  AND trim(i.sku) <> ''
-                ORDER BY trim(i.sku)
-                """,
-                (connected_seller_id, connected_seller_id),
-            )
-            rows = cur.fetchall()
-    return [str(r[0]) for r in rows if r and r[0]]
-
 def badge(status: str | None) -> str:
     status = (status or "").lower()
 
@@ -1756,6 +1535,32 @@ def badge(status: str | None) -> str:
 def root(request: Request):
     user = get_session_user(request)
     return RedirectResponse(url="/painel" if user else "/login")
+
+
+@app.get("/template/sku-min-receber.csv")
+def download_template_min_receive_csv(request: Request):
+    require_user(request)
+    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
+    return PlainTextResponse("sku;vlr_min_receber\nSKU-EXEMPLO-1;120,00\nSKU-EXEMPLO-2;95,50\n", media_type="text/csv", headers=headers)
+
+
+@app.get("/account/min-receive")
+def account_min_receive_list(request: Request, account_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
+    return {"count": count_account_min_receive(account_id), "rows": list_account_min_receive(account_id, 50)}
+
+
+@app.post("/account/min-receive/upload")
+async def account_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin"))
+    content = await file.read()
+    rows = parse_min_receive_file(file.filename or '', content)
+    if not rows:
+        raise HTTPException(status_code=400, detail='Nenhum registro válido encontrado no arquivo.')
+    saved = replace_account_min_receive(account_id, int(user['id']), file.filename or 'upload', rows)
+    return {"ok": True, "rows_saved": saved}
 
 
 @app.get("/health")
@@ -2024,52 +1829,6 @@ def auth_google_callback(request: Request):
 
     return response
 
-
-@app.get("/template/sku-min-receber.csv")
-def download_template_min_receive_csv(request: Request, connected_seller_id: int):
-    user = require_user(request)
-    require_connected_seller_access(int(user["id"]), connected_seller_id)
-
-    skus = get_latest_inventory_unique_skus(connected_seller_id)
-
-    if not skus:
-        raise HTTPException(status_code=404, detail="Nenhum SKU encontrado.")
-
-    lines = ["SKU;$_CLASSICO;$_PREMIUM"]
-
-    for sku in skus:
-        lines.append(f"{sku};;")
-
-    content = "\n".join(lines) + "\n"
-
-    return PlainTextResponse(
-        content,
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": 'attachment; filename="template_sku_minimo.csv"'
-        },
-    )
-
-
-@app.get("/account/min-receive")
-def account_min_receive_list(request: Request, account_id: int):
-    user = require_user(request)
-    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
-    return {"count": count_account_min_receive(account_id), "rows": list_account_min_receive(account_id, 50)}
-
-
-@app.post("/account/min-receive/upload")
-async def account_min_receive_upload(request: Request, account_id: int, file: UploadFile = File(...)):
-    user = require_user(request)
-    require_account_role(int(user["id"]), account_id, ("owner", "admin"))
-    content = await file.read()
-    rows = parse_min_receive_file_v2(file.filename or "", content)
-    if not rows:
-        raise HTTPException(status_code=400, detail="Nenhum registro válido encontrado no arquivo.")
-    saved = replace_account_min_receive_v2(account_id, int(user["id"]), file.filename or "upload", rows)
-    return {"ok": True, "rows_saved": saved}
-
-
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
     user = require_user(request)
@@ -2116,8 +1875,7 @@ def run_optimizer(request: Request, connected_seller_id: int = 1, limit: int = 0
     require_connected_seller_access(int(user["id"]), connected_seller_id)
     started = time.time()
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
-    cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
+    cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return {
         "status": "optimizer executado",
@@ -2131,7 +1889,6 @@ def run_optimizer(request: Request, connected_seller_id: int = 1, limit: int = 0
         "stdout": result.stdout,
         "stderr": result.stderr,
         "csv_file": csv_path.name if csv_path.exists() else None,
-        "csv_detailed_file": csv_detailed_path.name if csv_detailed_path.exists() else None,
     }
 
 
@@ -2146,8 +1903,7 @@ def run_full(request: Request, connected_seller_id: int = 1, limit: int = 0, dry
     r2 = subprocess.run(build_rebate_cmd(connected_seller_id, limit), capture_output=True, text=True)
     results["rebate"] = r2.stdout or r2.stderr
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
-    r3 = subprocess.run(build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path), capture_output=True, text=True)
+    r3 = subprocess.run(build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path), capture_output=True, text=True)
     results["optimizer"] = r3.stdout or r3.stderr
     return {
         "status": "full run executado",
@@ -2157,7 +1913,6 @@ def run_full(request: Request, connected_seller_id: int = 1, limit: int = 0, dry
         "use_cost": use_cost,
         "elapsed_seconds": round(time.time() - started, 2),
         "csv_file": csv_path.name if csv_path.exists() else None,
-        "csv_detailed_file": csv_detailed_path.name if csv_detailed_path.exists() else None,
         "results": results,
     }
 
@@ -2189,7 +1944,6 @@ def run_inventory_async(request: Request, connected_seller_id: int = 1, limit: i
         payload={"cmd": build_inventory_cmd(connected_seller_id, limit)},
         log_file=log_path.name,
         csv_file=None,
-        csv_detailed_file=None,
     )
     return async_ok_response("inventory enfileirado", run_id, connected_seller_id, limit, log_file=log_path.name)
 
@@ -2210,7 +1964,6 @@ def run_rebate_async(request: Request, connected_seller_id: int = 1, limit: int 
         payload={"cmd": build_rebate_cmd(connected_seller_id, limit)},
         log_file=log_path.name,
         csv_file=None,
-        csv_detailed_file=None,
     )
     return async_ok_response("rebate enfileirado", run_id, connected_seller_id, limit, log_file=log_path.name)
 
@@ -2221,12 +1974,8 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
     seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
     account_id = int(seller_access["account_id"])
     validate_plan_access(account_id, limit, enforce_mlb_limit=True)
-    log_path = build_log_path("optimizer_rebate_run")
+    log_path = build_log_path("optimizer_run")
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
-    rebate_cmd = build_rebate_cmd(connected_seller_id, limit)
-    optimizer_cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
-    combined_cmd = build_rebate_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
     run_id = insert_job(
         job_type="optimizer",
         connected_seller_id=connected_seller_id,
@@ -2234,18 +1983,15 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         dry_run=dry_run,
         use_cost=use_cost,
         payload={
-            "cmd": combined_cmd,
-            "rebate_cmd": rebate_cmd,
-            "optimizer_cmd": optimizer_cmd,
-            "flow": "rebate_then_optimizer",
+            "rebate_cmd": build_rebate_cmd(connected_seller_id, limit),
+            "cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path),
         },
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
     register_daily_execution(account_id)
     return async_ok_response(
-        "otimização enfileirada",
+        "optimizer enfileirado",
         run_id,
         connected_seller_id,
         limit,
@@ -2253,8 +1999,8 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         use_cost=use_cost,
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
+
 
 @app.get("/run/full_async")
 def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
@@ -2264,7 +2010,6 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
     validate_plan_access(account_id, limit, enforce_mlb_limit=True)
     log_path = build_log_path("full_pipeline")
     csv_path = build_csv_path()
-    csv_detailed_path = build_detailed_csv_path()
     run_id = insert_job(
         job_type="full",
         connected_seller_id=connected_seller_id,
@@ -2274,11 +2019,10 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
         payload={
             "inventory_cmd": build_inventory_cmd(connected_seller_id, limit),
             "rebate_cmd": build_rebate_cmd(connected_seller_id, limit),
-            "optimizer_cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path),
+            "optimizer_cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path),
         },
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
     register_daily_execution(account_id)
     return async_ok_response(
@@ -2290,7 +2034,6 @@ def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 
         use_cost=use_cost,
         log_file=log_path.name,
         csv_file=csv_path.name,
-        csv_detailed_file=csv_detailed_path.name,
     )
 
 
@@ -2372,33 +2115,6 @@ def download_csv(request: Request, filename: str | None = None, run_id: str | No
     raise HTTPException(status_code=404, detail="CSV não encontrado")
 
 
-@app.get("/download/csv_detailed")
-def download_csv_detailed(request: Request, filename: str | None = None, run_id: str | None = None):
-    user = require_user(request)
-    if run_id:
-        require_run_access(int(user["id"]), run_id)
-
-    if filename:
-        file_path = CSV_DIR / filename
-        if file_path.exists() and file_path.is_file():
-            return FileResponse(path=str(file_path), filename=filename, media_type="text/csv")
-
-    if run_id:
-        payload = get_job_csv_payload(run_id)
-        if not payload:
-            raise HTTPException(status_code=404, detail="run_id não encontrado")
-
-        csv_content = payload.get("csv_detailed_content")
-        csv_file = payload.get("csv_detailed_file") or "resultado_detalhado.csv"
-        mime = payload.get("csv_detailed_mime_type") or "text/csv"
-
-        if csv_content:
-            headers = {"Content-Disposition": f'attachment; filename="{csv_file}"'}
-            return PlainTextResponse(csv_content, media_type=mime, headers=headers)
-
-    raise HTTPException(status_code=404, detail="CSV detalhado não encontrado")
-
-
 @app.get("/download/log")
 def download_log(request: Request, filename: str):
     user = require_user(request)
@@ -2456,9 +2172,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
     limit_label = "Todos os anúncios"
 
     inventory_item_count = get_latest_inventory_item_count(connected_seller_id)
-    mlb_stats = get_latest_inventory_mlb_stats(connected_seller_id)
-    latest_inventory_skus = get_latest_inventory_unique_skus(connected_seller_id)
-    can_download_min_receive_template = len(latest_inventory_skus) > 0
     inventory_plan_warning = ""
 
     if subscription:
@@ -2594,7 +2307,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .summary-headline {{ font-size: 16px; color: #e8eeff; }}
             .metrics {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; }}
             .metric {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 14px; padding: 12px; }}
-            .metrics.metrics-3 {{ grid-template-columns: repeat(3, 1fr); }}
             .metric-label {{ font-size: 12px; color: #9fb0d9; margin-bottom: 4px; }}
             .metric-value {{ font-size: 22px; font-weight: 800; }}
             .warn-box {{ display:none; margin-top: 10px; padding: 12px 14px; border-radius: 12px; background: rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.28); color:#fde68a; }}
@@ -2651,60 +2363,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             .invite-item {{ padding: 10px 12px; border-radius: 12px; background: rgba(2,8,23,0.55); margin-bottom: 8px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:center; }}
             .invite-meta {{ color:#9fb0d9; font-size:12px; margin-top:4px; }}
             .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
+            .card.compact {{ padding: 18px; }}
             .user-pill {{ padding:8px 12px; border-radius:999px; background: rgba(255,255,255,0.08); color:#dbeafe; font-size:13px; }}
-            @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .metrics.metrics-3 {{ grid-template-columns: 1fr; }} .hero h1 {{ font-size: 40px; }} }}
-            .card.compact {{
-                padding: 18px;
-            }}
-
-            /* Linha do título */
-            .sku-header {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-
-            /* Botões menores */
-            .btn-small {{
-                width: auto;
-                padding: 8px 14px;
-                font-size: 13px;
-                border-radius: 10px;
-            }}
-
-            /* Linha de upload */
-            .sku-actions {{
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                margin-top: 12px;
-            }}
-
-            /* Input ocupa espaço */
-            .sku-file {{
-                flex: 1;
-                font-size: 13px;
-            }}
-
-            /* Mobile */
-            @media (max-width: 980px) {{
-                .sku-header {{
-                    flex-direction: column;
-                    align-items: flex-start;
-                    gap: 8px;
-                }}
-
-                .sku-actions {{
-                    flex-direction: column;
-                    align-items: stretch;
-                }}
-
-                .sku-file,
-                .btn-small {{
-                    width: 100%;
-                }}
-            }}
-
+            @media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .small-grid {{ grid-template-columns: 1fr; }} .metrics {{ grid-template-columns: 1fr 1fr; }} .hero h1 {{ font-size: 40px; }} }}
+            .card.compact {{padding: 16px;min-height: unset;}}
 </style>
     </head>
     <body>
@@ -2743,67 +2405,41 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <div id="recentJobs">Carregando...</div>
                     </div>
                 </div>
+                <div style="display:flex; flex-direction:column; gap:20px;">
                 <div class="card">
-                    <h2>Otimização de campanhas</h2>
+                    <h2>Executar otimização</h2>
                     <div class="form-row">
                         <label>Conta ativa</label>
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
-                        <div class="card compact" style="margin-top:20px;">
-
-                            <div class="sku-header">
-                                <h2>SKU mínimo</h2>
-
-                                {"<a href=\"/template/sku-min-receber.csv?connected_seller_id=%s\" target=\"_blank\" class=\"button-link\">\n                                    <button class=\"btn btn-secondary btn-small\" type=\"button\">\n                                        Baixar template\n                                    </button>\n                                </a>" % connected_seller_id if can_download_min_receive_template else ""}
-                            </div>
-
-                            <div class="muted">Upload de SKU x valor mínimo a receber</div>
-
-                            <div class="sku-actions">
-                                <input type="file" id="minReceiveFile" accept=".csv,.xlsx" class="sku-file" />
-
-                                <button class="btn btn-primary btn-small" type="button" onclick="uploadMinReceive()">
-                                    Enviar arquivo
-                                </button>
-                            </div>
-
-                            <div class="muted" id="minReceiveInfo" style="margin-top:10px;"></div>
-
-                        </div>
-
-                        <div class="muted">Escolha se deseja apenas simular ou aplicar a melhor campanha encontrada para cada anúncio.</div>
+                        <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
                     </div>
                     <div class="form-row">
                         <label>Escopo da execução</label>
                         <div class="scope-box">{limit_label}</div>
-                        <div class="scope-help">A otimização usa o escopo do plano. A atualização de anúncios pode mapear a conta para revisar preços, tarifas e fretes.</div>
+                        <div class="scope-help">Rebate, Optimizer e Otimização Completa usam o escopo do plano. Inventory pode mapear toda a conta para sinalizar excedentes.</div>
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
-                    <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar (não altera campanhas)</label></div>
-                    <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Considerar custo do produto na decisão</label></div>
+                    <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar</label></div>
+                    <div class="muted" style="margin-top:5px; line-height:1.5;">Se Simular antes de aplicar estiver marcado, nada será alterado no Mercado Livre.</div>
+                    <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>
                     <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
                             <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar anúncios e fretes</button>
                             <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Aplicar melhor campanha</button>
+                        </div>
+                        <div class="muted" style="margin-top:5px; line-height:1.5;">
+                            Aplicar melhor campanha atualiza os rebates/campanhas disponíveis e depois roda o optimizer.
+                        </div>
+                        <div class="small-grid" style="margin-top:12px;">
                             <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar atualização completa</button>
                         </div>
-                        <div class="muted" style="margin-top:10px; line-height:1.5;">
-                            <strong>Aplicar melhor campanha</strong> atualiza os rebates/campanhas disponíveis e depois roda o optimizer.
-                            Se <strong>Simular antes de aplicar</strong> estiver marcado, nada será alterado no Mercado Livre.
+                        <div class="muted" style="margin-top:5px; line-height:1.5;">
+                            Rodar atualização completa executa todo o processo: atualiza anúncios e fretes, atualiza rebates/campanhas disponíveis e depois roda o optimizer.
                         </div>
                     </div>
                     <div class="muted" id="jobInfo"></div>
-                    <div class="summary-card">
-                        <div class="summary-title">Anúncios mapeados</div>
-                        <div class="summary-headline">Visão do último inventory executado.</div>
-                        <div class="muted">Mostra a quantidade distinta de MLBs totais, ativos e pausados do último snapshot.</div>
-                        <div class="metrics metrics-3">
-                            <div class="metric"><div class="metric-label">MLBs totais</div><div class="metric-value">{mlb_stats["total_mlbs"]}</div></div>
-                            <div class="metric"><div class="metric-label">MLBs ativos</div><div class="metric-value">{mlb_stats["active_mlbs"]}</div></div>
-                            <div class="metric"><div class="metric-label">MLBs pausados</div><div class="metric-value">{mlb_stats["paused_mlbs"]}</div></div>
-                        </div>
-                    </div>
                     <div class="summary-card">
                         <div class="summary-title">Resumo geral</div>
                         <div class="summary-headline" id="summaryHeadline">Nenhum job executado ainda.</div>
@@ -2815,6 +2451,26 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div class="metric"><div class="metric-label">Erros/Falhas</div><div class="metric-value" id="mErrors">-</div></div>
                         </div>
                     </div>
+                </div>
+                <div class="card">
+                    <h2>Valor Mínimo a receber por SKU</h2>
+                    <div class="muted">Baixe o template, preencha <strong>sku</strong> e <strong>vlr_min_receber</strong> e envie o arquivo.</div>
+                    <input type="hidden" id="currentAccountId" value="{current_account_id}" />
+                    <div class="actions" style="margin-top:14px;">
+                        <a class="button-link" href="/template/sku-min-receber.csv" target="_blank"><button class="btn btn-secondary" type="button">Baixar template CSV</button></a>
+                    </div>
+                    <div class="invite-row" style="margin-top:14px;">
+                        <div>
+                            <label for="minReceiveFile">Arquivo CSV ou XLSX</label>
+                            <input type="file" id="minReceiveFile" accept=".csv,.xlsx" />
+                        </div>
+                        <div>
+                            <button class="btn btn-primary" style="width:auto; height:40px; padding:0 18px; font-size:14px;" onclick="uploadMinReceive()">Enviar arquivo</button>
+                        </div>
+                    </div>
+                    <div class="muted" id="minReceiveInfo" style="margin-top:12px;">Nenhum arquivo enviado nesta sessão.</div>
+                    <div class="invite-list" id="minReceiveList">Carregando tabela...</div>
+                </div>
                 </div>
             </div>
             <div class="card" style="margin-top:20px;">
@@ -2848,7 +2504,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <h2>Resultado / Log</h2>
                     <div id="downloadArea" class="download-area">
                         <a id="downloadCsvLink" href="#" target="_blank"><button class="btn btn-secondary" type="button">Baixar CSV</button></a>
-                        <a id="downloadCsvDetailedLink" href="#" target="_blank"><button class="btn btn-secondary" type="button">Baixar CSV Detalhado</button></a>
                                             </div>
                 </div>
                 <pre id="output">Nenhuma execução ainda.</pre>
@@ -2876,10 +2531,9 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             function setOutput(text) {{ document.getElementById("output").innerText = text; }}
             function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
 
-            function setDownloads(csvFile, csvDetailedFile, runId, hasCsv, hasCsvDetailed, statusValue) {{
+            function setDownloads(csvFile, runId, hasCsv, statusValue) {{
                 const area = document.getElementById("downloadArea");
                 const csvLink = document.getElementById("downloadCsvLink");
-                const csvDetailedLink = document.getElementById("downloadCsvDetailedLink");
                 let show = false;
 
                 const finished = statusValue === "finished";
@@ -2890,15 +2544,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 }} else {{
                     csvLink.style.display = "none";
                     csvLink.href = "#";
-                }}
-
-                if (finished && hasCsvDetailed && runId) {{
-                    csvDetailedLink.href = `/download/csv_detailed?run_id=${{encodeURIComponent(runId)}}`;
-                    csvDetailedLink.style.display = "inline-block";
-                    show = true;
-                }} else {{
-                    csvDetailedLink.style.display = "none";
-                    csvDetailedLink.href = "#";
                 }}
 
                 area.classList.toggle("show", show);
@@ -3043,7 +2688,6 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
                                 <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
                                 ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
-                                ${{j.has_csv_detailed ? `<a target="_blank" href="/download/csv_detailed?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV Detalhado</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
@@ -3056,7 +2700,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
                     setOutput(logText || JSON.stringify(status, null, 2));
                     setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
-                    setDownloads(status.csv_file, status.csv_detailed_file, status.run_id, status.has_csv, status.has_csv_detailed, status.status);
+                    setDownloads(status.csv_file, status.run_id, status.has_csv, status.status);
                     setSummary(status.summary);
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
@@ -3073,7 +2717,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     const data = await fetchJson(url);
                     setOutput(JSON.stringify(data, null, 2));
                     setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.csv_detailed_file || null, data.run_id || null, false, false, "queued");
+                    setDownloads(data.csv_file || null, data.run_id || null, false, "queued");
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
                     if (data.run_id) startPolling(data.run_id);
@@ -3083,52 +2727,10 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 }}
             }}
 
-
-            async function uploadMinReceive() {{
-                const fileInput = document.getElementById("minReceiveFile");
-                const info = document.getElementById("minReceiveInfo");
-                const accountId = document.getElementById("currentAccountId")?.value;
-
-                if (!fileInput || !fileInput.files || !fileInput.files.length) {{
-                    alert("Selecione um arquivo CSV ou XLSX.");
-                    return;
-                }}
-                if (!accountId) {{
-                    alert("account_id não encontrado na tela.");
-                    return;
-                }}
-
-                const formData = new FormData();
-                formData.append("file", fileInput.files[0]);
-
-                info.innerText = "Enviando arquivo...";
-                try {{
-                    const res = await fetch(`/account/min-receive/upload?account_id=${{encodeURIComponent(accountId)}}`, {{
-                        method: "POST",
-                        body: formData
-                    }});
-                    const text = await res.text();
-                    let data = null;
-                    try {{
-                        data = JSON.parse(text);
-                    }} catch (e) {{
-                        if (!res.ok) throw new Error(text);
-                        throw e;
-                    }}
-                    if (!res.ok) {{
-                        const detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || data);
-                        throw new Error(detail);
-                    }}
-                    info.innerText = `Arquivo enviado com sucesso. ${{data.rows_saved || 0}} SKU(s) salvos.`;
-                    fileInput.value = "";
-                }} catch (e) {{
-                    info.innerText = `Erro no upload: ${{String(e)}}`;
-                }}
-            }}
-
-            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Atualizando anúncios, preços, tarifas e fretes..."); }}
-            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Atualizando campanhas disponíveis e rodando a otimização..."); }}
-            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Rodando atualização completa: anúncios, rebates e optimizer..."); }}
+            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando inventory..."); }}
+            async function rodarRebateAsync() {{ const p = getParams(); await runAsync(`/run/rebate_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando rebate..."); }}
+            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando optimizer..."); }}
+            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando pipeline completa..."); }}
 
             async function logout() {{
                 await fetch("/auth/logout", {{ method: "POST" }});
@@ -3138,6 +2740,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             toggleLimitInput();
             refreshRecentJobs();
             refreshInvites();
+            refreshMinReceive();
         </script>
     </body>
     </html>
