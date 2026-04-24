@@ -269,6 +269,37 @@ def _mk_session(insecure: bool = False) -> requests.Session:
     return s
 
 
+_thread_local = threading.local()
+
+
+def _get_thread_session(insecure: bool = False) -> requests.Session:
+    """Uma Session por thread evita compartilhar requests.Session entre workers."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = _mk_session(insecure=insecure)
+        _thread_local.session = session
+    return session
+
+
+class ThreadSafeCache:
+    """Cache simples com lock para evitar corrupção/duplicidade em concorrência."""
+    def __init__(self):
+        self._data: dict[Any, Any] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: Any) -> Any:
+        with self._lock:
+            return self._data.get(key)
+
+    def setdefault_fetch(self, key: Any, fetcher):
+        with self._lock:
+            if key in self._data:
+                return self._data[key]
+        value = fetcher()
+        with self._lock:
+            return self._data.setdefault(key, value)
+
+
 class RateLimiter:
     def __init__(self, rps: float):
         self.rps = float(rps)
@@ -1085,25 +1116,47 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
 
         if session is not None and auth_headers is not None:
             fee_key = (item.category_id or "", item.listing_type_id or "", str(q2(new_price)))
-            if fee_key not in fee_cache:
-                fee_cache[fee_key] = fetch_listing_fee(
-                    session,
-                    new_price,
-                    item.category_id,
-                    item.listing_type_id,
-                    auth_headers=auth_headers,
+            if hasattr(fee_cache, "setdefault_fetch"):
+                fee_info = fee_cache.setdefault_fetch(
+                    fee_key,
+                    lambda: fetch_listing_fee(
+                        session,
+                        new_price,
+                        item.category_id,
+                        item.listing_type_id,
+                        auth_headers=auth_headers,
+                    ),
                 )
-            fee_info = fee_cache[fee_key]
+            else:
+                if fee_key not in fee_cache:
+                    fee_cache[fee_key] = fetch_listing_fee(
+                        session,
+                        new_price,
+                        item.category_id,
+                        item.listing_type_id,
+                        auth_headers=auth_headers,
+                    )
+                fee_info = fee_cache[fee_key]
             fee_amount_candidate = to_decimal(fee_info.get("fee_amount")) or Decimal("0")
 
             ship_key = item.mlb
-            if ship_key not in shipping_cache:
-                shipping_cache[ship_key] = fetch_shipping_option(
-                    session,
-                    item.mlb,
-                    auth_headers=auth_headers,
+            if hasattr(shipping_cache, "setdefault_fetch"):
+                ship_info = shipping_cache.setdefault_fetch(
+                    ship_key,
+                    lambda: fetch_shipping_option(
+                        session,
+                        item.mlb,
+                        auth_headers=auth_headers,
+                    ),
                 )
-            ship_info = shipping_cache[ship_key]
+            else:
+                if ship_key not in shipping_cache:
+                    shipping_cache[ship_key] = fetch_shipping_option(
+                        session,
+                        item.mlb,
+                        auth_headers=auth_headers,
+                    )
+                ship_info = shipping_cache[ship_key]
             shipping_cost_candidate = to_decimal(ship_info.get("shipping_list_cost")) or Decimal("0")
 
             cand["fee_amount_candidate"] = q2(fee_amount_candidate)
@@ -1167,27 +1220,49 @@ def choose_best_candidate(item: ScopeItem, promotions_payload: list[dict], tax_p
 
                         if fee_amount_candidate is None:
                             fee_key = (item.category_id or "", item.listing_type_id or "", str(q2(new_price)))
-                            if fee_key not in fee_cache:
-                                fee_cache[fee_key] = fetch_listing_fee(
-                                    session,
-                                    new_price,
-                                    item.category_id,
-                                    item.listing_type_id,
-                                    auth_headers=auth_headers,
+                            if hasattr(fee_cache, "setdefault_fetch"):
+                                fee_info = fee_cache.setdefault_fetch(
+                                    fee_key,
+                                    lambda: fetch_listing_fee(
+                                        session,
+                                        new_price,
+                                        item.category_id,
+                                        item.listing_type_id,
+                                        auth_headers=auth_headers,
+                                    ),
                                 )
-                            fee_info = fee_cache[fee_key]
+                            else:
+                                if fee_key not in fee_cache:
+                                    fee_cache[fee_key] = fetch_listing_fee(
+                                        session,
+                                        new_price,
+                                        item.category_id,
+                                        item.listing_type_id,
+                                        auth_headers=auth_headers,
+                                    )
+                                fee_info = fee_cache[fee_key]
                             fee_amount_candidate = to_decimal(fee_info.get("fee_amount")) or Decimal("0")
                             cand["fee_amount_candidate"] = q2(fee_amount_candidate)
 
                         if shipping_cost_candidate is None:
                             ship_key = item.mlb
-                            if ship_key not in shipping_cache:
-                                shipping_cache[ship_key] = fetch_shipping_option(
-                                    session,
-                                    item.mlb,
-                                    auth_headers=auth_headers,
+                            if hasattr(shipping_cache, "setdefault_fetch"):
+                                ship_info = shipping_cache.setdefault_fetch(
+                                    ship_key,
+                                    lambda: fetch_shipping_option(
+                                        session,
+                                        item.mlb,
+                                        auth_headers=auth_headers,
+                                    ),
                                 )
-                            ship_info = shipping_cache[ship_key]
+                            else:
+                                if ship_key not in shipping_cache:
+                                    shipping_cache[ship_key] = fetch_shipping_option(
+                                        session,
+                                        item.mlb,
+                                        auth_headers=auth_headers,
+                                    )
+                                ship_info = shipping_cache[ship_key]
                             shipping_cost_candidate = to_decimal(ship_info.get("shipping_list_cost")) or Decimal("0")
                             cand["shipping_cost_candidate"] = q2(shipping_cost_candidate)
 
@@ -1570,11 +1645,12 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                   threads: int, rps: float, insecure: bool, out_csv: str, out_detailed_csv: str | None, flush_every: int,
                   use_cost: bool, mlb_filter: set[str] | None = None,
                   sku_min_receive_map: dict[str, dict[str, Decimal | None]] | None = None) -> dict:
+    # Sessão principal apenas para compatibilidade; workers usam sessão própria por thread.
     session = _mk_session(insecure=insecure)
     limiter = RateLimiter(rps)
     auth_headers = build_auth_headers(connected_seller_id)
-    fee_cache: dict = {}
-    shipping_cache: dict = {}
+    fee_cache = ThreadSafeCache()
+    shipping_cache = ThreadSafeCache()
 
     if mlb_filter:
         items = [item for item in items if item.mlb in mlb_filter]
@@ -1631,8 +1707,9 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
             pending_rows = []
 
         def worker(item: ScopeItem):
+            worker_session = _get_thread_session(insecure=insecure)
             limiter.wait()
-            promos = item_promotions(session, connected_seller_id, item.mlb, auth_headers=auth_headers)
+            promos = item_promotions(worker_session, connected_seller_id, item.mlb, auth_headers=auth_headers)
             decision, reason = choose_best_candidate(
                 item,
                 promos,
@@ -1643,7 +1720,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                 sku_min_receive_map=sku_min_receive_map,
                 fee_cache=fee_cache,
                 shipping_cache=shipping_cache,
-                session=session,
+                session=worker_session,
                 auth_headers=auth_headers,
             )
             decision["tax_pct"] = tax_pct
@@ -1674,7 +1751,7 @@ def process_items(connected_seller_id: int, items: list[ScopeItem], source_run_i
                     return row, build_detailed_rows_from_decision(row, item, decision, "max_switch_reached", False)
 
             api_result = campaign_item_upsert(
-                session=session,
+                session=worker_session,
                 connected_seller_id=connected_seller_id,
                 campaign_id=candidate["promotion_id"],
                 item_id=item.mlb,
