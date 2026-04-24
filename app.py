@@ -2423,7 +2423,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar</label></div>
                     <div class="muted" style="margin-top:5px; line-height:1.5;">Se Simular antes de aplicar estiver marcado, nada será alterado no Mercado Livre.</div>
                     <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>
-                    <div class="warn-box" id="activeJobWarn"></div>
+                    <div class="warn-box" id="activeJobWarn" style="display:none;"></div>
                     <div class="actions">
                         <div class="small-grid">
                             <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar anúncios e fretes</button>
@@ -2744,16 +2744,21 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
         
 function renderActiveJobWarn(data) {{
   const el = document.getElementById('activeJobWarn');
-  if(!el) return;
+
+  if (!el) return; // 👈 ESSENCIAL
+
   let msg = "⚠️ Já existe uma atualização em andamento. Aguarde a conclusão antes de iniciar outra.";
+
   try {{
     const st = data?.status || data?.detail?.status;
-    if(st === 'queued') {{
+
+    if (st === 'queued') {{
       msg = "⏳ Sua solicitação está na fila. Em breve será iniciada.";
-    }} else if(st === 'running') {{
-      msg = "🔄 Estamos processando sua otimização agora. Aguarde a conclusão.";
+    }} else if (st === 'running') {{
+      msg = "🔄 Estamos processando sua otimização agora.";
     }}
-  }} catch(e) {{}}
+  }} catch(e){{}}
+
   el.innerText = msg;
   el.style.display = 'block';
 }}
