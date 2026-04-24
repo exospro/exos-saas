@@ -630,19 +630,25 @@ def pick_shipping_option(shipping_options: dict) -> dict:
     if not options:
         return {}
 
-    valid_options = [opt for opt in options if _shipping_effective_cost(opt) is not None]
-    if not valid_options:
-        return {}
+    def effective(opt: dict):
+        return _shipping_effective_cost(opt)
 
-    fulfillment_options = [opt for opt in valid_options if (opt.get("shipping_method_type") or "").lower() == "fulfillment"]
-    if fulfillment_options:
-        valid_options = fulfillment_options
+    # 1) PRIORIDADE: SLOW
+    slow_options = [
+        opt for opt in options
+        if (opt.get("shipping_method_type") or "").lower() == "slow"
+        and effective(opt) is not None
+    ]
+    if slow_options:
+        return sorted(slow_options, key=lambda o: effective(o) or Decimal("999999"))[0]
 
-    def opt_key(opt: dict):
-        eff = _shipping_effective_cost(opt)
-        return (eff if eff is not None else Decimal("999999"),)
+    # 2) fallback: qualquer opção válida
+    valid_options = [opt for opt in options if effective(opt) is not None]
+    if valid_options:
+        return sorted(valid_options, key=lambda o: effective(o) or Decimal("999999"))[0]
 
-    return sorted(valid_options, key=opt_key)[0]
+    return {}
+
 
 
 def fetch_shipping_option(
