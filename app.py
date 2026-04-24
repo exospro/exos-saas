@@ -2741,9 +2741,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             refreshRecentJobs();
             refreshInvites();
             refreshMinReceive();
-        
-function renderActiveJobWarn(data){
-  const el = document.getElementById('activeJobWarn');
+
   if(!el) return;
   let msg = "⚠️ Já existe uma atualização em andamento. Aguarde a conclusão antes de iniciar outra.";
   try{
