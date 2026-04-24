@@ -1513,12 +1513,29 @@ def build_job_summary(job: dict) -> dict:
 
 def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) -> list[dict]:
     sql = """
-    SELECT
-        run_id, job_type, status, step, connected_seller_id,
-        limit_items, dry_run, use_cost, payload_json, result_json,
-        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv, error, created_at, started_at, finished_at, updated_at
-    FROM app.async_job
-    """
+        SELECT
+            run_id,
+            job_type,
+            status,
+            step,
+            connected_seller_id,
+            limit_items,
+            dry_run,
+            use_cost,
+            payload_json,
+            result_json,
+            log_file,
+            csv_file,
+            csv_detailed_file,
+            (csv_content IS NOT NULL) AS has_csv,
+            (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
+            error,
+            created_at,
+            started_at,
+            finished_at,
+            updated_at
+        FROM app.async_job
+        """
     params = []
     if connected_seller_id is not None:
         sql += " WHERE connected_seller_id = %s"
