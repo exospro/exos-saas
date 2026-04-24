@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse, Response
 import os
 import re
 import time
@@ -1021,7 +1021,8 @@ def get_job_csv_payload(run_id: str) -> dict | None:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT run_id, csv_file, csv_content, csv_mime_type, csv_bytes
+                SELECT run_id, csv_file, csv_content, csv_mime_type, csv_bytes,
+                       csv_detailed_file, csv_detailed_content
                 FROM app.async_job
                 WHERE run_id = %s
                 """,
@@ -1141,6 +1142,7 @@ def get_active_job_for_seller(connected_seller_id: int) -> dict | None:
                     run_id, job_type, status, step, connected_seller_id,
                     limit_items, dry_run, use_cost, log_file, csv_file,
                     (csv_content IS NOT NULL) AS has_csv,
+                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
                     error, created_at, started_at, finished_at, updated_at,
                     payload_json, result_json
                 FROM app.async_job
@@ -1238,6 +1240,7 @@ def get_job(run_id: str) -> dict:
                     log_file,
                     csv_file,
                     (csv_content IS NOT NULL) AS has_csv,
+                    (csv_detailed_content IS NOT NULL) AS has_csv_detailed,
                     error,
                     created_at,
                     started_at,
@@ -1295,6 +1298,7 @@ def build_optimizer_cmd(
     use_cost: bool,
     csv_path: Path,
 ) -> list[str]:
+    csv_detailed_path = csv_path.with_name(f"{csv_path.stem}_detalhado{csv_path.suffix or '.csv'}")
     cmd = [
         "python3",
         "-m",
@@ -1305,6 +1309,8 @@ def build_optimizer_cmd(
         "true" if use_cost else "false",
         "--out",
         str(csv_path),
+        "--out-detailed",
+        str(csv_detailed_path),
     ]
     if limit_items and limit_items > 0:
         cmd.extend(["--limit", str(limit_items)])
@@ -1471,7 +1477,7 @@ def recent_jobs_rows(limit: int = 20, connected_seller_id: int | None = None) ->
     SELECT
         run_id, job_type, status, step, connected_seller_id,
         limit_items, dry_run, use_cost, payload_json, result_json,
-        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv, error, created_at, started_at, finished_at, updated_at
+        log_file, csv_file, (csv_content IS NOT NULL) AS has_csv, (csv_detailed_content IS NOT NULL) AS has_csv_detailed, csv_detailed_file, error, created_at, started_at, finished_at, updated_at
     FROM app.async_job
     """
     params = []
@@ -2098,10 +2104,20 @@ def run_log(request: Request, run_id: str):
     return PlainTextResponse(f"Sem log disponível ainda. status={job.get('status')} step={job.get('step')}")
 
 @app.get("/download/csv")
-def download_csv(request: Request, filename: str | None = None, run_id: str | None = None):
+def download_csv(
+    request: Request,
+    filename: str | None = None,
+    run_id: str | None = None,
+    kind: str = "summary",
+):
     user = require_user(request)
+    kind = (kind or "summary").strip().lower()
+    if kind not in ("summary", "detailed"):
+        raise HTTPException(status_code=400, detail="kind inválido. Use summary ou detailed.")
+
     if run_id:
         require_run_access(int(user["id"]), run_id)
+
     # caminho 1: arquivo local no mesmo serviço
     if filename:
         file_path = CSV_DIR / filename
@@ -2114,13 +2130,21 @@ def download_csv(request: Request, filename: str | None = None, run_id: str | No
         if not payload:
             raise HTTPException(status_code=404, detail="run_id não encontrado")
 
-        csv_content = payload.get("csv_content")
-        csv_file = payload.get("csv_file") or "resultado.csv"
         mime = payload.get("csv_mime_type") or "text/csv"
 
-        if csv_content:
-            headers = {"Content-Disposition": f'attachment; filename="{csv_file}"'}
-            return PlainTextResponse(csv_content, media_type=mime, headers=headers)
+        if kind == "detailed":
+            csv_detailed_content = payload.get("csv_detailed_content")
+            csv_detailed_file = payload.get("csv_detailed_file") or "resultado_detalhado.csv"
+            if csv_detailed_content:
+                headers = {"Content-Disposition": f'attachment; filename="{csv_detailed_file}"'}
+                return Response(content=bytes(csv_detailed_content), media_type=mime, headers=headers)
+
+        else:
+            csv_content = payload.get("csv_content")
+            csv_file = payload.get("csv_file") or "resultado.csv"
+            if csv_content:
+                headers = {"Content-Disposition": f'attachment; filename="{csv_file}"'}
+                return PlainTextResponse(csv_content, media_type=mime, headers=headers)
 
     raise HTTPException(status_code=404, detail="CSV não encontrado")
 
@@ -2540,7 +2564,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
                 const finished = statusValue === "finished";
                 if (finished && hasCsv && runId) {{
-                    csvLink.href = `/download/csv?run_id=${{encodeURIComponent(runId)}}`;
+                    csvLink.href = `/download/csv?run_id=${{encodeURIComponent(runId)}}&kind=summary`;
                     csvLink.style.display = "inline-block";
                     show = true;
                 }} else {{
@@ -2689,7 +2713,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
                                 <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
                                 <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
-                                ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
+                                ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}&kind=summary"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV resumo</button></a>` : ''}}
+                                ${{j.has_csv_detailed ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}&kind=detailed"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV detalhado</button></a>` : ''}}
                             </div>
                         </div>
                     `).join("");
