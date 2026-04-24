@@ -1348,7 +1348,7 @@ def build_optimizer_cmd(
         "true" if use_cost else "false",
         "--out",
         str(csv_path),
-        "--out-detailed-csv",
+        "--out-detailed",
         str(csv_detailed_path or build_detailed_csv_path()),
     ]
     if limit_items and limit_items > 0:
