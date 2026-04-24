@@ -6,6 +6,7 @@ import os
 import random
 import time
 import threading
+import traceback
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,7 +37,7 @@ _thread_local = threading.local()
 
 def make_http_session(pool_size: int = 20) -> requests.Session:
     """Cria uma Session com pool maior para chamadas concorrentes."""
-    session = make_http_session(pool_size=20)
+    session = requests.Session()
     adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -727,11 +728,14 @@ def main() -> None:
                     try:
                         result = future.result()
                     except Exception as exc:
+                        tb = traceback.format_exc()
+                        print(f"[REBATE][EXECUTOR_EXCEPTION] mlb={mlb} | exc={repr(exc)}")
+                        print(tb)
                         result = {
                             "ok": False,
                             "item_id": mlb,
                             "promotions": [],
-                            "error": {"status_code": None, "reason": "executor_error", "body": {"message": repr(exc)}},
+                            "error": {"status_code": None, "reason": "executor_error", "body": {"message": repr(exc), "traceback": tb}},
                         }
 
                     if result["ok"]:
