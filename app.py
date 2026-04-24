@@ -2567,7 +2567,8 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     return;
                 }}
                 box.style.display = "block";
-                box.innerText = `Já existe job em andamento: ${{active.job_type}} | status=${{active.status}} | etapa=${{active.step || '-'}} | run_id=${{active.run_id}}`;
+                //box.innerText = `Já existe job em andamento: ${{active.job_type}} | status=${{active.status}} | etapa=${{active.step || '-'}} | run_id=${{active.run_id}}`;
+                box.innerText = `Já existe job em andamento, aguarde sua finalização`;
             }}
 
             async function fetchJson(url, options = undefined) {{
