@@ -36,7 +36,7 @@ _thread_local = threading.local()
 
 def make_http_session(pool_size: int = 20) -> requests.Session:
     """Cria uma Session com pool maior para chamadas concorrentes."""
-    session = make_http_session(pool_size=max(10, int(os.environ.get('ML_REBATE_SNAPSHOT_MAX_WORKERS', DEFAULT_MAX_WORKERS)) * 4))
+    session = make_http_session(pool_size=20)
     adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -653,7 +653,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     connected_seller_id = args.connected_seller_id
-    session = requests.Session()
+    session = make_http_session(pool_size=20)
 
     with db_connect() as conn:
         ensure_table(conn)
@@ -731,7 +731,7 @@ def main() -> None:
                             "ok": False,
                             "item_id": mlb,
                             "promotions": [],
-                            "error": {"status_code": None, "reason": "executor_error", "body": {"message": str(exc)}},
+                            "error": {"status_code": None, "reason": "executor_error", "body": {"message": repr(exc)}},
                         }
 
                     if result["ok"]:
@@ -740,7 +740,7 @@ def main() -> None:
                         promotions_by_item[mlb] = []
                         failed_items.append({"mlb": mlb, "error": result["error"]})
                         err = result["error"]
-                        print(f"[REBATE][ERRO] mlb={mlb} | status={err['status_code']} | reason={err['reason']}")
+                        print(f"[REBATE][ERRO] mlb={mlb} | status={err['status_code']} | reason={err['reason']} | detalhe={(err.get('body') or {}).get('message')}")
 
                     processed_mlbs.append(mlb)
 
