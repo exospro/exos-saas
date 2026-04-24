@@ -5,11 +5,13 @@ import argparse
 import os
 import random
 import time
+import threading
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from psycopg2.extras import Json, RealDictCursor, execute_values
 
@@ -23,11 +25,32 @@ DEFAULT_TIMEOUT = int(os.environ.get("ML_REBATE_SNAPSHOT_TIMEOUT_SEC", "60"))
 APP_VERSION = "v2"
 DEFAULT_RETRY_MAX_ATTEMPTS = int(os.environ.get("ML_REBATE_SNAPSHOT_MAX_ATTEMPTS", "4"))
 DEFAULT_RETRY_BASE_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_BASE_SLEEP_SEC", "1.2"))
-DEFAULT_REQUEST_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_REQUEST_SLEEP_SEC", "0.10"))
+DEFAULT_REQUEST_SLEEP_SEC = float(os.environ.get("ML_REBATE_SNAPSHOT_REQUEST_SLEEP_SEC", "0.00"))
 DEFAULT_FINAL_REPROCESS = os.environ.get("ML_REBATE_SNAPSHOT_FINAL_REPROCESS", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEFAULT_MAX_WORKERS = int(os.environ.get("ML_REBATE_SNAPSHOT_MAX_WORKERS", "5"))
 DEFAULT_INSERT_BATCH_SIZE = int(os.environ.get("ML_REBATE_SNAPSHOT_INSERT_BATCH_SIZE", "200"))
+
+_thread_local = threading.local()
+
+
+def make_http_session(pool_size: int = 20) -> requests.Session:
+    """Cria uma Session com pool maior para chamadas concorrentes."""
+    session = make_http_session(pool_size=max(10, int(os.environ.get('ML_REBATE_SNAPSHOT_MAX_WORKERS', DEFAULT_MAX_WORKERS)) * 4))
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def get_thread_session(pool_size: int = 20) -> requests.Session:
+    """Uma Session por thread evita compartilhar requests.Session entre workers."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = make_http_session(pool_size=pool_size)
+        _thread_local.session = session
+    return session
+
 
 
 def to_decimal(value: Any):
@@ -343,6 +366,26 @@ def fetch_item_promotions_with_retry(
     }
 
 
+def fetch_item_promotions_with_retry_threadsafe(
+    *,
+    connected_seller_id: int,
+    mlb: str,
+    headers: dict[str, str],
+    max_attempts: int,
+    base_sleep_sec: float,
+    pool_size: int,
+) -> dict[str, Any]:
+    session = get_thread_session(pool_size=pool_size)
+    return fetch_item_promotions_with_retry(
+        session,
+        connected_seller_id,
+        mlb,
+        headers=headers,
+        max_attempts=max_attempts,
+        base_sleep_sec=base_sleep_sec,
+    )
+
+
 def reprocess_failed_items(
     session: requests.Session,
     connected_seller_id: int,
@@ -637,6 +680,8 @@ def main() -> None:
                 "base_sleep_sec": args.base_sleep_sec,
                 "request_sleep_sec": args.request_sleep_sec,
                 "final_reprocess": bool(args.final_reprocess),
+                "max_workers": int(args.max_workers),
+                "insert_batch_size": int(args.insert_batch_size),
             },
         )
 
@@ -657,18 +702,22 @@ def main() -> None:
             )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                pool_size = max(10, max_workers * 4)
                 future_map = {}
                 for mlb in mlbs:
                     future = executor.submit(
-                        fetch_item_promotions_with_retry,
-                        session,
-                        connected_seller_id,
-                        mlb,
+                        fetch_item_promotions_with_retry_threadsafe,
+                        connected_seller_id=connected_seller_id,
+                        mlb=mlb,
                         headers=headers,
                         max_attempts=args.max_attempts,
                         base_sleep_sec=args.base_sleep_sec,
+                        pool_size=pool_size,
                     )
                     future_map[future] = mlb
+
+                    # Mantido como throttle opcional, mas agora o default é 0.
+                    # Se precisar reduzir 429, use --request-sleep-sec ou a env ML_REBATE_SNAPSHOT_REQUEST_SLEEP_SEC.
                     if args.request_sleep_sec > 0:
                         time.sleep(args.request_sleep_sec)
 
