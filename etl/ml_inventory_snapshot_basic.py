@@ -36,7 +36,7 @@ _thread_local = threading.local()
 
 def make_http_session(pool_size: int = 20) -> requests.Session:
     """Cria uma Session com pool maior para chamadas concorrentes."""
-    session = make_http_session(pool_size=max(10, int(args.max_workers) * 4))
+    session = requests.Session()
     adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
