@@ -1927,6 +1927,34 @@ def run_rebate(request: Request, connected_seller_id: int = 1, limit: int = 0):
     }
 
 
+
+@app.get("/download/csv_detailed")
+def download_csv_detailed(request: Request, filename: str | None = None, run_id: str | None = None):
+    user = require_user(request)
+    if run_id:
+        require_run_access(int(user["id"]), run_id)
+
+    if filename:
+        file_path = CSV_DIR / filename
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(path=str(file_path), filename=filename, media_type="text/csv")
+
+    if run_id:
+        payload = get_job_csv_payload(run_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="run_id não encontrado")
+
+        csv_content = payload.get("csv_detailed_content")
+        csv_file = payload.get("csv_detailed_file") or "resultado_detalhado.csv"
+        mime = payload.get("csv_detailed_mime_type") or "text/csv"
+
+        if csv_content:
+            headers = {"Content-Disposition": f'attachment; filename="{csv_file}"'}
+            return PlainTextResponse(csv_content, media_type=mime, headers=headers)
+
+    raise HTTPException(status_code=404, detail="CSV detalhado não encontrado")
+
+
 @app.get("/run/optimizer")
 def run_optimizer(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
     user = require_user(request)
@@ -2584,17 +2612,39 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             function setOutput(text) {{ const el = document.getElementById("output"); if (el) el.innerText = text || ""; }}
             function setJobInfo(text) {{ const el = document.getElementById("jobInfo"); if (el) el.innerText = text || ""; }}
 
-            function setDownloads(csvFile, runId, hasCsv, statusValue) {{
-                const area = document.getElementById("downloadArea");
-                const csvLink = document.getElementById("downloadCsvLink");
-                let show = false;
+            function setDownloads(csvFile, csvDetailedFile, runId, hasCsv, hasCsvDetailed, status) {{
+                const el = document.getElementById("downloadArea");
+                if (!el) return;
 
-                const finished = statusValue === "finished";
-                if (finished && hasCsv && runId) {{
-                    csvLink.href = `/download/csv?run_id=${{encodeURIComponent(runId)}}`;
-                    csvLink.style.display = "inline-block";
-                    show = true;
-                }} else {{
+                if (!runId || status !== "finished") {{
+                    el.innerHTML = "";
+                    return;
+                }}
+
+                const buttons = [];
+
+                if (hasCsv || csvFile) {{
+                    buttons.push(`
+                        <a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(runId)}}">
+                            <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">
+                                CSV
+                            </button>
+                        </a>
+                    `);
+                }}
+
+                if (hasCsvDetailed || csvDetailedFile) {{
+                    buttons.push(`
+                        <a target="_blank" href="/download/csv_detailed?run_id=${{encodeURIComponent(runId)}}">
+                            <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">
+                                CSV Detalhado
+                            </button>
+                        </a>
+                    `);
+                }}
+
+                el.innerHTML = buttons.join(" ");
+            }} else {{
                     csvLink.style.display = "none";
                     csvLink.href = "#";
                 }}
