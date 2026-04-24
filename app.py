@@ -2412,7 +2412,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                     <div class="job-list">
                         <div><strong>Histórico recente</strong></div>
-                        <div id="recentJobs">Carregando...</div>
+                        <!--<div id="recentJobs">Carregando...</div>-->
                     </div>
                 </div>
                 <div style="display:flex; flex-direction:column; gap:20px;">
@@ -2431,7 +2431,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
                     <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simulação (não altera campanhas)</label></div>
-                    <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>
+                    <!--<div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>-->
                     <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
