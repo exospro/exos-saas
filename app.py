@@ -2782,12 +2782,17 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
-                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar anúncios e fretes</button>
+                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Importar anúncios e fretes</button>
                             <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Aplicar melhor campanha</button>
+                            <div class="muted" style="margin-top:10px; line-height:1.5;">
+                                <strong>* Aplicar melhor campanha</strong> atualiza os rebates/campanhas disponíveis e depois ativa o MLB na melhor campanha.
+                            </div>
+                        </div>
+                        <div class="small-grid">
                             <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar atualização completa</button>
                         </div>
                         <div class="muted" style="margin-top:10px; line-height:1.5;">
-                            <strong>* Aplicar melhor campanha</strong> atualiza os rebates/campanhas disponíveis e depois ativa o MLB na melhor campanha.
+                            <strong>* Rodar atualização completa</strong> executa todos os passos de atualização de anúncios e fretes e melhor campanha.
                         </div>
                     </div>
                     <div class="muted" id="jobInfo"></div>
