@@ -2529,7 +2529,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             }}
 
             function setOutput(text) {{ document.getElementById("output").innerText = text; }}
-            function setJobInfo(text) {{ document.getElementById("jobInfo").innerText = text || ""; }}
+            function setJobInfo(text) {{ const el = document.getElementById("jobInfo"); if (el) el.innerText = text || ""; }}
 
             function setDownloads(csvFile, runId, hasCsv, statusValue) {{
                 const area = document.getElementById("downloadArea");
