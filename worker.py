@@ -53,6 +53,32 @@ def save_csv_to_job(run_id: str, csv_path: Path | None) -> bool:
     return True
 
 
+def detailed_csv_path_from_summary(csv_path: Path) -> Path:
+    return csv_path.with_name(f"{csv_path.stem}_detalhado{csv_path.suffix or '.csv'}")
+
+
+def save_detailed_csv_to_job(run_id: str, csv_path: Path | None) -> bool:
+    if not csv_path or not csv_path.exists() or not csv_path.is_file():
+        return False
+
+    content = csv_path.read_bytes()
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE app.async_job
+                   SET csv_detailed_content = %s,
+                       csv_detailed_file = %s,
+                       updated_at = now()
+                 WHERE run_id = %s
+                """,
+                (content, csv_path.name, run_id),
+            )
+        conn.commit()
+    return True
+
+
 def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_last: int = 1) -> int:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -214,11 +240,19 @@ def run_command(cmd: list[str], log_path: Path, label: str) -> dict:
 def maybe_store_csv_for_job(run_id: str, csv_file: str | None, log_path: Path) -> None:
     if not csv_file:
         return
+
     csv_path = CSV_DIR / csv_file
+
     if save_csv_to_job(run_id, csv_path):
-        append_log(log_path, f"[WORKER] CSV salvo no banco | run_id={run_id} | csv_file={csv_file}")
+        append_log(log_path, f"[WORKER] CSV resumo salvo no banco | run_id={run_id} | csv_file={csv_file}")
     else:
-        append_log(log_path, f"[WORKER] CSV não encontrado para salvar no banco | run_id={run_id} | csv_file={csv_file}")
+        append_log(log_path, f"[WORKER] CSV resumo não encontrado para salvar no banco | run_id={run_id} | csv_file={csv_file}")
+
+    detailed_path = detailed_csv_path_from_summary(csv_path)
+    if save_detailed_csv_to_job(run_id, detailed_path):
+        append_log(log_path, f"[WORKER] CSV detalhado salvo no banco | run_id={run_id} | csv_file={detailed_path.name}")
+    else:
+        append_log(log_path, f"[WORKER] CSV detalhado não encontrado para salvar no banco | run_id={run_id} | csv_file={detailed_path.name}")
 
 
 def finalize_and_cleanup(run_id: str, connected_seller_id: int, log_path: Path, *, result_json: dict, csv_file: str | None) -> None:
