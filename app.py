@@ -1439,6 +1439,41 @@ def build_optimizer_cmd(
     return cmd
 
 
+
+def build_rebate_optimizer_cmd(
+    connected_seller_id: int,
+    limit_items: int,
+    dry_run: bool,
+    use_cost: bool,
+    csv_path: Path,
+    csv_detailed_path: Path | None = None,
+) -> list[str]:
+    """Executa rebate antes do optimizer no mesmo job, sem rodar inventory."""
+    rebate_cmd = build_rebate_cmd(connected_seller_id, limit_items)
+    optimizer_cmd = build_optimizer_cmd(connected_seller_id, limit_items, dry_run, use_cost, csv_path, csv_detailed_path)
+    runner = f"""
+import subprocess
+import sys
+import time
+commands = {json.dumps([rebate_cmd, optimizer_cmd], ensure_ascii=False)}
+labels = ["REBATE", "OPTIMIZER"]
+for label, cmd in zip(labels, commands):
+    started = time.time()
+    print(f"===== {{label}} | iniciando =====", flush=True)
+    print(f"[{{label}}] CMD: {{' '.join(cmd)}}", flush=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout, end="", flush=True)
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+    elapsed = round(time.time() - started, 2)
+    print(f"===== {{label}} | returncode={{result.returncode}} | elapsed_seconds={{elapsed}} =====", flush=True)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+""".strip()
+    return ["python3", "-c", runner]
+
+
 def parse_optimizer_stats(text: str) -> dict:
     stats = {}
     if not text:
@@ -2185,23 +2220,31 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
     seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
     account_id = int(seller_access["account_id"])
     validate_plan_access(account_id, limit, enforce_mlb_limit=True)
-    log_path = build_log_path("optimizer_run")
+    log_path = build_log_path("optimizer_rebate_run")
     csv_path = build_csv_path()
     csv_detailed_path = build_detailed_csv_path()
+    rebate_cmd = build_rebate_cmd(connected_seller_id, limit)
+    optimizer_cmd = build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
+    combined_cmd = build_rebate_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)
     run_id = insert_job(
         job_type="optimizer",
         connected_seller_id=connected_seller_id,
         limit_items=limit,
         dry_run=dry_run,
         use_cost=use_cost,
-        payload={"cmd": build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path)},
+        payload={
+            "cmd": combined_cmd,
+            "rebate_cmd": rebate_cmd,
+            "optimizer_cmd": optimizer_cmd,
+            "flow": "rebate_then_optimizer",
+        },
         log_file=log_path.name,
         csv_file=csv_path.name,
         csv_detailed_file=csv_detailed_path.name,
     )
     register_daily_execution(account_id)
     return async_ok_response(
-        "optimizer enfileirado",
+        "otimização enfileirada",
         run_id,
         connected_seller_id,
         limit,
@@ -2211,7 +2254,6 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         csv_file=csv_path.name,
         csv_detailed_file=csv_detailed_path.name,
     )
-
 
 @app.get("/run/full_async")
 def run_full_async(request: Request, connected_seller_id: int = 1, limit: int = 0, dry_run: bool = True, use_cost: bool = False):
@@ -2701,7 +2743,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                     </div>
                 </div>
                 <div class="card">
-                    <h2>Executar otimização</h2>
+                    <h2>Otimização de campanhas</h2>
                     <div class="form-row">
                         <label>Conta ativa</label>
                         <div class="status-line"><strong>{seller.get('seller_nickname') or 'Conta conectada'}</strong></div>
@@ -2727,24 +2769,27 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
 
                         </div>
 
-                        <div class="muted">Esta otimização será executada para a conta conectada acima.</div>
+                        <div class="muted">Escolha se deseja apenas simular ou aplicar a melhor campanha encontrada para cada anúncio.</div>
                         <input type="hidden" id="connectedSellerId" value="{connected_seller_id}" />
                     </div>
                     <div class="form-row">
                         <label>Escopo da execução</label>
                         <div class="scope-box">{limit_label}</div>
-                        <div class="scope-help">Rebate, Optimizer e Otimização Completa usam o escopo do plano. Inventory pode mapear toda a conta para sinalizar excedentes.</div>
+                        <div class="scope-help">A otimização usa o escopo do plano. A atualização de anúncios pode mapear a conta para revisar preços, tarifas e fretes.</div>
                         <input type="hidden" id="limit" value="{default_limit}" />
                     </div>
-                    <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simulação (não altera campanhas)</label></div>
-                    <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Usar custo do produto</label></div>
+                    <div class="check"><input type="checkbox" id="dryrun" checked /><label for="dryrun">Simular antes de aplicar (não altera campanhas)</label></div>
+                    <div class="check"><input type="checkbox" id="usecost" /><label for="usecost">Considerar custo do produto na decisão</label></div>
                     <div class="warn-box" id="activeJobWarn"></div>
                     <div class="actions">
                         <div class="small-grid">
-                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar MLBs</button>
-                            <button class="btn btn-secondary" onclick="rodarRebateAsync()">Atualizar Rebate</button>
-                            <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Ativar Campanha Vencedora</button>
-                            <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar Otimização Completa</button>
+                            <button class="btn btn-secondary" onclick="rodarInventoryAsync()">Atualizar anúncios e fretes</button>
+                            <button class="btn btn-primary" onclick="rodarOptimizerAsync()">Aplicar melhor campanha</button>
+                            <button class="btn btn-connect" onclick="rodarFullAsync()">Rodar atualização completa</button>
+                        </div>
+                        <div class="muted" style="margin-top:10px; line-height:1.5;">
+                            <strong>Aplicar melhor campanha</strong> atualiza os rebates/campanhas disponíveis e depois roda o optimizer.
+                            Se <strong>Simular antes de aplicar</strong> estiver marcado, nada será alterado no Mercado Livre.
                         </div>
                     </div>
                     <div class="muted" id="jobInfo"></div>
@@ -3080,10 +3125,9 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 }}
             }}
 
-            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando inventory..."); }}
-            async function rodarRebateAsync() {{ const p = getParams(); await runAsync(`/run/rebate_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando rebate..."); }}
-            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando optimizer..."); }}
-            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando pipeline completa..."); }}
+            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Atualizando anúncios, preços, tarifas e fretes..."); }}
+            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Atualizando campanhas disponíveis e rodando a otimização..."); }}
+            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Rodando atualização completa: anúncios, rebates e optimizer..."); }}
 
             async function logout() {{
                 await fetch("/auth/logout", {{ method: "POST" }});
