@@ -2007,6 +2007,7 @@ def run_full(request: Request, connected_seller_id: int = 1, limit: int = 0, dry
     r2 = subprocess.run(build_rebate_cmd(connected_seller_id, limit), capture_output=True, text=True)
     results["rebate"] = r2.stdout or r2.stderr
     csv_path = build_csv_path()
+    csv_detailed_path = build_detailed_csv_path()
     r3 = subprocess.run(build_optimizer_cmd(connected_seller_id, limit, dry_run, use_cost, csv_path, csv_detailed_path), capture_output=True, text=True)
     results["optimizer"] = r3.stdout or r3.stderr
     return {
@@ -2806,9 +2807,18 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                             <div style="margin-top:4px; color:#9fb0d9">criado_em=${{fmtDate(j.created_at)}}</div>
                             <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
                                 <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" onclick="verJob('${{j.run_id}}')">Ver job</button>
-                                <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Status</button></a>
-                                <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">Log</button></a>
-                                ${{j.has_csv ? `<a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;" type="button">CSV</button></a>` : ''}}
+                                <a target="_blank" href="/run/status?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">Status</button></a>
+                                <a target="_blank" href="/run/log?run_id=${{j.run_id}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">Log</button></a>
+                                ${{j.has_csv ? `
+                                    <a target="_blank" href="/download/csv?run_id=${{encodeURIComponent(j.run_id)}}"><button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">CSV</button></a>` : ''}}
+
+                                ${{j.has_csv_detailed ? `
+                                    <a target="_blank" href="/download/csv_detailed?run_id=${{encodeURIComponent(j.run_id)}}">
+                                        <button class="btn btn-secondary" style="width:auto; padding:8px 12px; font-size:13px;">
+                                            CSV Detalhado
+                                        </button>
+                                    </a>
+                                ` : ''}}
                             </div>
                         </div>
                     `).join("");
