@@ -268,7 +268,21 @@ def run_single_job(job: dict) -> None:
             finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=None, csv_detailed_file=None)
 
         elif job_type == "optimizer":
-            update_job(run_id, step="optimizer")
+            # Fluxo novo do botão principal: atualiza rebate antes de rodar o optimizer.
+            # Mantém compatibilidade: se o payload antigo não tiver rebate_cmd, roda só o optimizer.
+            rebate_cmd = payload.get("rebate_cmd")
+            if rebate_cmd:
+                update_job(run_id, step="rebate", result_json=result_json)
+                append_log(log_path, "[PIPELINE] Etapa 1/2 - Rebate: iniciando antes do optimizer")
+                r1 = run_command(rebate_cmd, log_path, "REBATE")
+                result_json["rebate"] = r1
+                if r1["returncode"] != 0:
+                    raise RuntimeError("Rebate falhou")
+            else:
+                append_log(log_path, "[PIPELINE] rebate_cmd ausente no payload; seguindo apenas com optimizer")
+
+            update_job(run_id, step="optimizer", result_json=result_json)
+            append_log(log_path, "[PIPELINE] Etapa 2/2 - Optimizer: iniciando")
             result = run_command(payload["cmd"], log_path, "OPTIMIZER")
             result_json["optimizer"] = result
             if result["returncode"] != 0:
