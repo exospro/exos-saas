@@ -1387,7 +1387,20 @@ def build_job_summary(job: dict) -> dict:
         return summary
 
     if status == "running":
-        summary["headline"] = f"Executando job de {job_type}."
+        if job_type == "optimizer" and step == "rebate":
+            summary["headline"] = "Atualizando rebates e campanhas disponíveis."
+        elif job_type == "optimizer" and step == "optimizer":
+            summary["headline"] = "Rodando optimizer e comparando campanhas."
+        elif job_type == "inventory":
+            summary["headline"] = "Atualizando anúncios, tarifas e fretes."
+        elif job_type == "full" and step == "inventory":
+            summary["headline"] = "Atualizando anúncios, tarifas e fretes."
+        elif job_type == "full" and step == "rebate":
+            summary["headline"] = "Atualizando rebates e campanhas disponíveis."
+        elif job_type == "full" and step == "optimizer":
+            summary["headline"] = "Rodando optimizer e comparando campanhas."
+        else:
+            summary["headline"] = f"Executando job de {job_type}."
         if step:
             summary["details"].append(f"Etapa atual: {step}")
         return summary
@@ -2528,7 +2541,7 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 return {{ connectedSellerId: document.getElementById("connectedSellerId").value, limit: getLimitValue(), dryRun: document.getElementById("dryrun").checked, useCost: document.getElementById("usecost").checked }};
             }}
 
-            function setOutput(text) {{ document.getElementById("output").innerText = text; }}
+            function setOutput(text) {{ const el = document.getElementById("output"); if (el) el.innerText = text || ""; }}
             function setJobInfo(text) {{ const el = document.getElementById("jobInfo"); if (el) el.innerText = text || ""; }}
 
             function setDownloads(csvFile, runId, hasCsv, statusValue) {{
@@ -2695,14 +2708,32 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
                 }} catch (e) {{ document.getElementById("recentJobs").innerText = String(e); }}
             }}
 
+            function jobStageMessage(status) {{
+                if (!status) return "";
+                if (status.status === "queued") return "Job enfileirado, aguardando processamento.";
+                if (status.status === "running") {{
+                    if (status.job_type === "optimizer" && status.step === "rebate") return "Atualizando rebates e campanhas disponíveis...";
+                    if (status.job_type === "optimizer" && status.step === "optimizer") return "Rodando optimizer e comparando campanhas...";
+                    if (status.job_type === "inventory") return "Atualizando anúncios, tarifas e fretes...";
+                    if (status.job_type === "full" && status.step === "inventory") return "Atualizando anúncios, tarifas e fretes...";
+                    if (status.job_type === "full" && status.step === "rebate") return "Atualizando rebates e campanhas disponíveis...";
+                    if (status.job_type === "full" && status.step === "optimizer") return "Rodando optimizer e comparando campanhas...";
+                    return "Processando execução...";
+                }}
+                if (status.status === "finished") return status.summary?.headline || "Execução finalizada.";
+                if (status.status === "error") return status.summary?.headline || "Execução finalizada com erro.";
+                return status.summary?.headline || "";
+            }}
+
             async function pollRun(runId) {{
                 try {{
                     const status = await fetchJson(`/run/status?run_id=${{encodeURIComponent(runId)}}`);
                     const logText = await fetchText(`/run/log?run_id=${{encodeURIComponent(runId)}}`);
-                    setOutput(logText || JSON.stringify(status, null, 2));
-                    setJobInfo(`run_id=${{status.run_id}} | tipo=${{status.job_type}} | status=${{status.status}} | etapa=${{status.step || '-'}} | iniciado=${{status.started_at || '-'}} | fim=${{status.finished_at || '-'}}`);
+                    const stageMsg = jobStageMessage(status);
+                    setOutput(logText || stageMsg || JSON.stringify(status, null, 2));
+                    setJobInfo("");
                     setDownloads(status.csv_file, status.run_id, status.has_csv, status.status);
-                    setSummary(status.summary);
+                    setSummary(status.summary || {{ headline: stageMsg, metrics: {{}} }});
                     await refreshRecentJobs();
                     if (status.status === "finished" || status.status === "error") stopPolling();
                 }} catch (err) {{ setOutput(String(err)); stopPolling(); }}
@@ -2714,24 +2745,26 @@ def painel(request: Request, connected_seller_id: int | None = None, connected: 
             async function runAsync(url, message) {{
                 stopPolling();
                 setOutput(message);
+                setSummary({{ headline: message, metrics: {{}} }});
                 try {{
                     const data = await fetchJson(url);
-                    setOutput(JSON.stringify(data, null, 2));
-                    setJobInfo(`run_id=${{data.run_id}} | status=${{data.status}}`);
-                    setDownloads(data.csv_file || null, data.run_id || null, false, "queued");
+                    const runId = data.run_id || null;
+                    setOutput(runId ? "Job enfileirado, aguardando processamento." : JSON.stringify(data, null, 2));
+                    setJobInfo("");
+                    setDownloads(data.csv_file || null, runId, false, "queued");
                     setSummary({{ headline: 'Job enfileirado, aguardando processamento.', metrics: {{}} }});
                     await refreshRecentJobs();
-                    if (data.run_id) startPolling(data.run_id);
+                    if (runId) startPolling(runId);
                 }} catch (err) {{
                     setOutput(String(err));
                     await refreshRecentJobs();
                 }}
             }}
 
-            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando inventory..."); }}
+            async function rodarInventoryAsync() {{ const p = getParams(); await runAsync(`/run/inventory_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Atualizando anúncios e fretes..."); }}
             async function rodarRebateAsync() {{ const p = getParams(); await runAsync(`/run/rebate_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}`, "Enfileirando rebate..."); }}
-            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando optimizer..."); }}
-            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Enfileirando pipeline completa..."); }}
+            async function rodarOptimizerAsync() {{ const p = getParams(); await runAsync(`/run/optimizer_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Atualizando rebates e depois rodando optimizer..."); }}
+            async function rodarFullAsync() {{ const p = getParams(); await runAsync(`/run/full_async?connected_seller_id=${{p.connectedSellerId}}&limit=${{p.limit}}&dry_run=${{p.dryRun}}&use_cost=${{p.useCost}}`, "Rodando atualização completa..."); }}
 
             async function logout() {{
                 await fetch("/auth/logout", {{ method: "POST" }});
