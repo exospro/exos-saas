@@ -325,6 +325,15 @@ def fetch_listing_prices(
 
 
 def pick_shipping_option(shipping_options: dict[str, Any]) -> dict[str, Any]:
+    """Escolhe a opção de frete para cálculo de margem.
+
+    Regra de negócio:
+    1) Sempre priorizar shipping_method_type = slow quando existir custo válido.
+    2) Se não houver slow válido, usar fulfillment válido como fallback.
+    3) Se não houver fulfillment válido, usar a menor opção válida.
+
+    Custo válido = primeiro valor positivo entre list_cost, base_cost e cost.
+    """
     options = shipping_options.get("options") or []
     if not options:
         return {}
@@ -344,19 +353,36 @@ def pick_shipping_option(shipping_options: dict[str, Any]) -> dict[str, Any]:
 
         return None
 
+    def method_type(opt: dict[str, Any]) -> str:
+        return (opt.get("shipping_method_type") or "").strip().lower()
+
+    def option_sort_key(opt: dict[str, Any]) -> Decimal:
+        return effective_shipping_cost(opt) or Decimal("999999")
+
+    # 1) Prioridade absoluta: SLOW
+    slow_options = [
+        opt for opt in options
+        if method_type(opt) == "slow"
+        and effective_shipping_cost(opt) is not None
+    ]
+    if slow_options:
+        return min(slow_options, key=option_sort_key)
+
+    # 2) Fallback: fulfillment válido, se existir
     fulfillment_options = [
         opt for opt in options
-        if (opt.get("shipping_method_type") or "").lower() == "fulfillment"
+        if method_type(opt) == "fulfillment"
         and effective_shipping_cost(opt) is not None
     ]
     if fulfillment_options:
-        return min(fulfillment_options, key=lambda opt: effective_shipping_cost(opt) or Decimal("999999"))
+        return min(fulfillment_options, key=option_sort_key)
 
+    # 3) Fallback final: menor custo válido entre as demais opções
     valid_options = [opt for opt in options if effective_shipping_cost(opt) is not None]
-    if not valid_options:
-        return {}
+    if valid_options:
+        return min(valid_options, key=option_sort_key)
 
-    return min(valid_options, key=lambda opt: effective_shipping_cost(opt) or Decimal("999999"))
+    return {}
 
 
 def fetch_shipping_option(
