@@ -342,6 +342,22 @@ def run_single_job(job: dict) -> None:
                 raise RuntimeError("Optimizer falhou")
             finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=csv_file)
 
+        elif job_type == "campaign_winner":
+            update_job(run_id, step="rebate")
+            rebate = run_command(payload["rebate_cmd"], log_path, "REBATE")
+            result_json["rebate"] = rebate
+
+            if rebate["returncode"] != 0:
+                raise RuntimeError("Rebate falhou. Optimizer não foi executado.")
+
+            update_job(run_id, step="optimizer")
+
+            optimizer_cmd = normalize_cmd_paths(payload["optimizer_cmd"], csv_file)
+            optimizer = run_command(optimizer_cmd, log_path, "OPTIMIZER")
+            result_json["optimizer"] = optimizer
+
+            if optimizer["returncode"] != 0:
+                raise RuntimeError("Optimizer falhou.")
         elif job_type == "full":
             update_job(run_id, step="inventory", result_json=result_json)
             append_log(log_path, "[PIPELINE] Etapa 1/3 - Inventory: iniciando")
