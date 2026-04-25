@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import re
 import time
@@ -35,7 +36,13 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
-BASE_DIR = Path("/opt/render/project/src")
+
+if os.environ.get("RENDER"):
+    BASE_DIR = Path("/opt/render/project/src")
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+
+BASE_DIR = Path(__file__).resolve().parent
 CSV_DIR = BASE_DIR / "runtime_csv"
 LOG_DIR = BASE_DIR / "runtime_logs"
 CSV_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,15 +50,25 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ACTIVE_JOB_STATUSES = ("queued", "running")
 
-
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
+
+IS_PROD = bool(os.environ.get("RENDER"))
 
 try:
     import openpyxl
 except Exception:
     openpyxl = None
 
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def ensure_trial_for_account(account_id: int) -> bool:
     """
@@ -390,82 +407,157 @@ def ensure_account_sku_min_receive_table() -> None:
         conn.commit()
 
 
-def parse_decimal_br(value) -> float:
-    text = str(value or '').strip()
+def parse_decimal_br(value):
+    text = str(value or "").strip()
+
     if not text:
-        raise ValueError('Valor vazio')
-    if ',' in text:
-        text = text.replace('.', '').replace(',', '.')
+        return None
+
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+
     return float(text)
 
 
-def parse_min_receive_file(filename: str, content: bytes) -> list[tuple[str, float]]:
-    name = (filename or '').lower()
-    rows: list[tuple[str, float]] = []
+def parse_min_receive_file(filename: str, content: bytes) -> list[tuple[str, float, float]]:
+    name = (filename or "").lower()
+    rows: list[tuple[str, float, float]] = []
 
-    if name.endswith('.csv'):
-        decoded = content.decode('utf-8-sig')
+    required_cols = ("sku", "vlr_min_classico", "vlr_min_premium")
+
+    if name.endswith(".csv"):
+        decoded = content.decode("utf-8-sig")
         sample = decoded[:4096]
-        delim = ';' if sample.count(';') >= sample.count(',') else ','
+        delim = ";" if sample.count(";") >= sample.count(",") else ","
         reader = csv.DictReader(decoded.splitlines(), delimiter=delim)
+
         fields = {str(f).strip().lower(): f for f in (reader.fieldnames or [])}
-        if 'sku' not in fields or 'vlr_min_receber' not in fields:
-            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
+
+        if not all(col in fields for col in required_cols):
+            raise HTTPException(
+                status_code=400,
+                detail="O arquivo deve conter as colunas SKU, VLR_MIN_CLASSICO e VLR_MIN_PREMIUM.",
+            )
+
         for row in reader:
-            sku = str(row.get(fields['sku']) or '').strip()
+            sku = str(row.get(fields["sku"]) or "").strip()
             if not sku:
                 continue
-            rows.append((sku, parse_decimal_br(row.get(fields['vlr_min_receber']))))
+
+            vlr_min_classico = parse_decimal_br(row.get(fields["vlr_min_classico"]))
+            vlr_min_premium = parse_decimal_br(row.get(fields["vlr_min_premium"]))
+
+            rows.append((sku, vlr_min_classico, vlr_min_premium))
+
         return rows
 
-    if name.endswith('.xlsx'):
+    if name.endswith(".xlsx"):
         if openpyxl is None:
-            raise HTTPException(status_code=500, detail='Suporte a XLSX não disponível. Adicione openpyxl ao requirements.txt.')
+            raise HTTPException(
+                status_code=500,
+                detail="Suporte a XLSX não disponível. Adicione openpyxl ao requirements.txt.",
+            )
+
         wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
         ws = wb.active
-        header = [str(c.value or '').strip().lower() for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        if 'sku' not in header or 'vlr_min_receber' not in header:
-            raise HTTPException(status_code=400, detail='O arquivo deve conter as colunas sku e vlr_min_receber.')
-        idx_sku = header.index('sku')
-        idx_val = header.index('vlr_min_receber')
+
+        header = [
+            str(c.value or "").strip().lower()
+            for c in next(ws.iter_rows(min_row=1, max_row=1))
+        ]
+
+        if not all(col in header for col in required_cols):
+            raise HTTPException(
+                status_code=400,
+                detail="O arquivo deve conter as colunas SKU, VLR_MIN_CLASSICO e VLR_MIN_PREMIUM.",
+            )
+
+        idx_sku = header.index("sku")
+        idx_classico = header.index("vlr_min_classico")
+        idx_premium = header.index("vlr_min_premium")
+
         for row in ws.iter_rows(min_row=2, values_only=True):
-            sku = str(row[idx_sku] or '').strip()
+            sku = str(row[idx_sku] or "").strip()
             if not sku:
                 continue
-            rows.append((sku, parse_decimal_br(row[idx_val])))
+
+            vlr_min_classico = parse_decimal_br(row[idx_classico])
+            vlr_min_premium = parse_decimal_br(row[idx_premium])
+
+            rows.append((sku, vlr_min_classico, vlr_min_premium))
+
         return rows
 
-    raise HTTPException(status_code=400, detail='Formato inválido. Envie um arquivo .csv ou .xlsx.')
+    raise HTTPException(
+        status_code=400,
+        detail="Formato inválido. Envie um arquivo .csv ou .xlsx.",
+    )
 
 
-def replace_account_min_receive(account_id: int, uploaded_by_user_id: int, filename: str, rows: list[tuple[str, float]]) -> int:
+def replace_account_min_receive(
+    account_id: int,
+    uploaded_by_user_id: int,
+    filename: str,
+    rows: list[tuple[str, float, float]],
+) -> int:
     ensure_account_sku_min_receive_table()
+
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute('DELETE FROM app.account_sku_min_receive WHERE account_id = %s', (account_id,))
+            cur.execute(
+                "DELETE FROM app.account_sku_min_receive WHERE account_id = %s",
+                (account_id,),
+            )
+
             if rows:
                 execute_values(
                     cur,
                     """
                     INSERT INTO app.account_sku_min_receive (
-                        account_id, sku, vlr_min_receber, source_file_name, uploaded_by_user_id, created_at, updated_at
-                    ) VALUES %s
+                        account_id,
+                        sku,
+                        min_receive_classico,
+                        min_receive_premium,
+                        source_file_name,
+                        uploaded_by_user_id,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES %s
                     """,
-                    [(account_id, sku, value, filename, uploaded_by_user_id) for sku, value in rows],
-                    template='(%s,%s,%s,%s,%s,now(),now())',
+                    [
+                        (
+                            account_id,
+                            sku,
+                            vlr_min_classico,
+                            vlr_min_premium,
+                            filename,
+                            uploaded_by_user_id,
+                        )
+                        for sku, vlr_min_classico, vlr_min_premium in rows
+                    ],
+                    template="(%s,%s,%s,%s,%s,%s,now(),now())",
                     page_size=500,
                 )
+
         conn.commit()
+
     return len(rows)
 
 
 def list_account_min_receive(account_id: int, limit: int = 50) -> list[dict]:
     ensure_account_sku_min_receive_table()
+
     with db_connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT sku, vlr_min_receber, source_file_name, updated_at
+                SELECT
+                    sku,
+                    min_receive_classico as vlr_classico,
+                    min_receive_premium as vlr_min_premium,
+                    source_file_name,
+                    updated_at
                 FROM app.account_sku_min_receive
                 WHERE account_id = %s
                 ORDER BY updated_at DESC, sku
@@ -474,6 +566,7 @@ def list_account_min_receive(account_id: int, limit: int = 50) -> list[dict]:
                 (account_id, limit),
             )
             rows = cur.fetchall()
+
     return [dict(r) for r in rows]
 
 
@@ -874,6 +967,24 @@ def render_login_page(error_message: str = "") -> str:
     </html>
     """
 
+@app.get("/api/me")
+def api_me(request: Request):
+    user = require_user(request)
+    sellers = get_accessible_connected_sellers(int(user["id"]))
+    return {
+        "user": user,
+        "sellers": sellers,
+    }
+
+@app.get("/api/jobs/recent")
+def api_jobs_recent(request: Request, connected_seller_id: int):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
+    return {
+        "jobs": recent_jobs_rows(20, connected_seller_id)
+    }
+
+
 @app.get("/onboarding", response_class=HTMLResponse)
 def onboarding_page(request: Request):
     user = require_user(request)
@@ -976,8 +1087,8 @@ def auth_google_start(request: Request):
         "state": state,
     }
     response = RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
-    response.set_cookie("google_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600)
-    response.set_cookie("post_login_redirect", return_to, httponly=True, secure=True, samesite="lax", max_age=600)
+    response.set_cookie("google_oauth_state", state, httponly=True, secure=IS_PROD, samesite="lax", max_age=600)
+    response.set_cookie("post_login_redirect", return_to, httponly=True, secure=IS_PROD, samesite="lax", max_age=600)
     return response
 
 
@@ -1064,11 +1175,16 @@ def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_las
     return deleted
 
 def build_csv_path(prefix: str = "campaign_optimizer_audit") -> Path:
+    base_dir = Path(os.environ.get("RENDER_RUNTIME_DIR", Path(__file__).resolve().parent))
+    csv_dir = base_dir / "runtime_csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return CSV_DIR / f"{prefix}_{timestamp}.csv"
+    return csv_dir / f"{prefix}_{timestamp}.csv"
 
 
 def build_log_path(prefix: str = "pipeline_run") -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return LOG_DIR / f"{prefix}_{timestamp}.log"
 
@@ -1298,7 +1414,13 @@ def build_optimizer_cmd(
     use_cost: bool,
     csv_path: Path,
 ) -> list[str]:
-    csv_detailed_path = csv_path.with_name(f"{csv_path.stem}_detalhado{csv_path.suffix or '.csv'}")
+    base_dir = Path(__file__).resolve().parent
+    runtime_csv_dir = base_dir / "runtime_csv"
+    runtime_csv_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_csv_path = runtime_csv_dir / csv_path.name
+    csv_detailed_path = runtime_csv_dir / f"{safe_csv_path.stem}_detalhado{safe_csv_path.suffix or '.csv'}"
+
     cmd = [
         "python3",
         "-m",
@@ -1308,14 +1430,17 @@ def build_optimizer_cmd(
         "--use-cost",
         "true" if use_cost else "false",
         "--out",
-        str(csv_path),
+        str(safe_csv_path),
         "--out-detailed",
         str(csv_detailed_path),
     ]
+
     if limit_items and limit_items > 0:
         cmd.extend(["--limit", str(limit_items)])
+
     if dry_run:
         cmd.append("--dry-run")
+
     return cmd
 
 
@@ -1377,7 +1502,7 @@ def parse_inventory_stats(text: str) -> dict:
 
 def build_job_summary(job: dict) -> dict:
     summary = {
-        "headline": "Job enfileirado.",
+        "headline": "Aguardando execução.",
         "status_label": job.get("status", "queued"),
         "details": [],
         "metrics": {},
@@ -1389,30 +1514,30 @@ def build_job_summary(job: dict) -> dict:
     result_json = job.get("result_json") or {}
 
     if status == "queued":
-        summary["headline"] = "Job enfileirado, aguardando processamento."
+        summary["headline"] = "Aguardando processamento."
         return summary
 
     if status == "running":
         if job_type == "optimizer" and step == "rebate":
-            summary["headline"] = "Atualizando rebates e campanhas disponíveis."
+            summary["headline"] = "Atualizando campanhas e rebates disponíveis."
         elif job_type == "optimizer" and step == "optimizer":
-            summary["headline"] = "Rodando optimizer e comparando campanhas."
+            summary["headline"] = "Rodando otimização completa."
         elif job_type == "inventory":
             summary["headline"] = "Atualizando anúncios, tarifas e fretes."
         elif job_type == "full" and step == "inventory":
             summary["headline"] = "Atualizando anúncios, tarifas e fretes."
         elif job_type == "full" and step == "rebate":
-            summary["headline"] = "Atualizando rebates e campanhas disponíveis."
+            summary["headline"] = "Atualizando campanhas e rebates disponíveis."
         elif job_type == "full" and step == "optimizer":
-            summary["headline"] = "Rodando optimizer e comparando campanhas."
+            summary["headline"] = "Rodando otimização completa"
         else:
-            summary["headline"] = f"Executando job de {job_type}."
+            summary["headline"] = f"Executando {job_type}."
         if step:
             summary["details"].append(f"Etapa atual: {step}")
         return summary
 
     if status == "error":
-        summary["headline"] = "Job finalizado com erro."
+        summary["headline"] = "Processo finalizado com erro."
         if job.get("error"):
             summary["details"].append(str(job["error"]))
         return summary
@@ -1420,7 +1545,7 @@ def build_job_summary(job: dict) -> dict:
     if status == "finished":
         if job_type == "inventory":
             inv = parse_inventory_stats(((result_json.get("inventory") or {}).get("stdout") or ""))
-            summary["headline"] = f"Inventory finalizado. {inv.get('item_ids_found', 0)} anúncios lidos."
+            summary["headline"] = f"Importação de MLBs finalizado. {inv.get('item_ids_found', 0)} anúncios lidos."
             summary["metrics"] = inv
             return summary
 
@@ -1428,9 +1553,9 @@ def build_job_summary(job: dict) -> dict:
             reb = parse_rebate_stats(((result_json.get("rebate") or {}).get("stdout") or ""))
             failed = reb.get("failed_items", 0)
             summary["headline"] = (
-                f"Rebate finalizado. {reb.get('rows_inserted', 0)} linhas gravadas."
+                f"Leitura de campanhas e rebates finalizado. {reb.get('rows_inserted', 0)} linhas gravadas."
                 if failed == 0 else
-                f"Rebate finalizado com {failed} falhas pontuais."
+                f"Leitura de campanhas e rebates finalizado com {failed} falhas pontuais."
             )
             summary["metrics"] = reb
             return summary
@@ -1440,9 +1565,9 @@ def build_job_summary(job: dict) -> dict:
             switched = opt.get("switched", 0)
             processed = opt.get("processed", 0)
             if switched > 0:
-                summary["headline"] = f"Optimizer finalizado. {switched} campanhas elegíveis para troca em {processed} itens analisados."
+                summary["headline"] = f"Otimização completa finalizado. {switched} campanhas elegíveis para troca em {processed} itens analisados."
             else:
-                summary["headline"] = f"Optimizer finalizado. Nenhuma troca necessária em {processed} itens analisados."
+                summary["headline"] = f"Otimização completa. Nenhuma troca necessária em {processed} itens analisados."
             summary["metrics"] = opt
             return summary
 
@@ -1454,9 +1579,9 @@ def build_job_summary(job: dict) -> dict:
             switched = opt.get("switched", 0)
             errors = opt.get("errors", 0)
             if switched > 0:
-                summary["headline"] = f"Pipeline finalizada. {switched} campanhas elegíveis para troca em {processed} itens analisados."
+                summary["headline"] = f"Otimização completa finalizada. {switched} campanhas elegíveis para troca em {processed} itens analisados."
             else:
-                summary["headline"] = f"Pipeline finalizada. Nenhuma troca necessária em {processed} itens analisados."
+                summary["headline"] = f"Otimização completa finalizada. Nenhuma troca necessária em {processed} itens analisados."
             summary["metrics"] = {
                 "item_ids_found": inv.get("item_ids_found"),
                 "rebate_failed_items": reb.get("failed_items"),
@@ -1466,7 +1591,7 @@ def build_job_summary(job: dict) -> dict:
                 "no_action": opt.get("no_action"),
             }
             if reb.get("failed_items", 0) > 0:
-                summary["details"].append(f"Rebate terminou com {reb.get('failed_items')} falhas pontuais da API.")
+                summary["details"].append(f"Leitura de campanhas e rebates terminou com {reb.get('failed_items')} falhas pontuais da API.")
             return summary
 
     return summary
@@ -1550,6 +1675,19 @@ def badge(status: str | None) -> str:
         f'background:{bg}; color:{fg};">{label}</span>'
     )
 
+def format_decimal_br(value) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.2f}".replace(".", ",")
+
+@app.get("/debug/cookies")
+def debug_cookies(request: Request):
+    return {
+        "cookies": request.cookies,
+        "session_cookie_name": APP_SESSION_COOKIE_NAME,
+        "is_prod": IS_PROD,
+    }
+
 @app.get("/")
 def root(request: Request):
     user = get_session_user(request)
@@ -1557,11 +1695,33 @@ def root(request: Request):
 
 
 @app.get("/template/sku-min-receber.csv")
-def download_template_min_receive_csv(request: Request):
-    require_user(request)
-    headers = {"Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'}
-    return PlainTextResponse("sku;vlr_min_receber\nSKU-EXEMPLO-1;120,00\nSKU-EXEMPLO-2;95,50\n", media_type="text/csv", headers=headers)
+def download_template_min_receive_csv(
+    request: Request,
+    account_id: int,
+    connected_seller_id: int,
+):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
 
+    csv_content = build_min_receive_template_csv(account_id, connected_seller_id)
+
+    if csv_content.strip() == "sku;vlr_min_classico;vlr_min_premium":
+        csv_content = (
+            "sku;vlr_min_classico;vlr_min_premium\n"
+            "SKU-EXEMPLO-1;120,00;119,00\n"
+            "SKU-EXEMPLO-2;95,50;94,50\n"
+        )
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="template_sku_min_receber.csv"'
+    }
+
+    return PlainTextResponse(
+        csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
 
 @app.get("/account/min-receive")
 def account_min_receive_list(request: Request, account_id: int):
@@ -1838,7 +1998,7 @@ def auth_google_callback(request: Request):
         APP_SESSION_COOKIE_NAME,
         session_token,
         httponly=True,
-        secure=True,
+        secure=IS_PROD,
         samesite="lax",
         max_age=APP_SESSION_DAYS * 24 * 60 * 60,
     )
@@ -1946,6 +2106,32 @@ def async_ok_response(message: str, run_id: str, connected_seller_id: int, limit
     payload.update(extra)
     return JSONResponse(payload)
 
+@app.get("/api/billing/summary")
+def api_billing_summary(request: Request, account_id: int):
+    user = require_user(request)
+    require_account_role(int(user["id"]), account_id, ("owner", "admin", "viewer"))
+
+    subscription = get_or_create_subscription(account_id)
+    if not subscription:
+        return {"subscription": None}
+
+    usage = get_today_usage(account_id)
+
+    daily_limit = int(subscription.get("daily_execution_limit") or 0)
+    executions_today = int(usage.get("executions_count") or 0)
+
+    period_end = subscription.get("current_period_end")
+    days_remaining = None
+    if period_end:
+        days_remaining = max((period_end - datetime.now(timezone.utc)).days, 0)
+
+    return {
+        "subscription": subscription,
+        "usage_today": usage,
+        "executions_today": executions_today,
+        "executions_remaining_today": max(daily_limit - executions_today, 0),
+        "days_remaining": days_remaining,
+    }
 
 @app.get("/run/inventory_async")
 def run_inventory_async(request: Request, connected_seller_id: int = 1, limit: int = 0):
@@ -2013,6 +2199,52 @@ def run_optimizer_async(request: Request, connected_seller_id: int = 1, limit: i
         limit,
         dry_run=dry_run,
         use_cost=use_cost,
+        log_file=log_path.name,
+        csv_file=csv_path.name,
+    )
+
+@app.get("/run/campaign_winner_async")
+def run_campaign_winner_async(
+    request: Request,
+    connected_seller_id: int = 1,
+    limit: int = 0,
+    dry_run: bool = True,
+    use_cost: bool = False,
+):
+    user = require_user(request)
+    seller_access = require_connected_seller_access(int(user["id"]), connected_seller_id)
+    account_id = int(seller_access["account_id"])
+
+    validate_plan_access(account_id, limit, enforce_mlb_limit=True)
+
+    log_path = build_log_path("campaign_winner_run")
+    csv_path = build_csv_path()
+
+    run_id = insert_job(
+        job_type="campaign_winner",
+        connected_seller_id=connected_seller_id,
+        limit_items=limit,
+        dry_run=dry_run,
+        use_cost=use_cost,
+        payload={
+            "rebate_cmd": build_rebate_cmd(connected_seller_id, limit),
+            "optimizer_cmd": build_optimizer_cmd(
+                connected_seller_id,
+                limit,
+                dry_run,
+                use_cost,
+                csv_path,
+            ),
+        },
+        log_file=log_path.name,
+        csv_file=csv_path.name,
+    )
+
+    return async_ok_response(
+        "campaign winner enfileirado",
+        run_id,
+        connected_seller_id,
+        limit,
         log_file=log_path.name,
         csv_file=csv_path.name,
     )
@@ -2177,6 +2409,52 @@ def active_job(request: Request, connected_seller_id: int):
         return {"active": None}
     active["summary"] = build_job_summary(active)
     return {"active": active}
+
+def build_min_receive_template_csv(account_id: int, connected_seller_id: int) -> str:
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                WITH latest_run AS (
+                    SELECT run_id
+                    FROM ml.inventory_snapshot_item
+                    WHERE connected_seller_id = %s
+                    ORDER BY collected_at DESC
+                    LIMIT 1
+                ),
+                skus AS (
+                    SELECT DISTINCT
+                        trim(i.sku) AS sku
+                    FROM ml.inventory_snapshot_item i
+                    JOIN latest_run lr
+                      ON lr.run_id = i.run_id
+                    WHERE i.connected_seller_id = %s
+                      AND i.sku IS NOT NULL
+                      AND trim(i.sku) <> ''
+                )
+                SELECT
+                    s.sku,
+                    m.min_receive_classico,
+                    m.min_receive_premium
+                FROM skus s
+                LEFT JOIN app.account_sku_min_receive m
+                  ON m.account_id = %s
+                 AND m.sku = s.sku
+                ORDER BY s.sku
+                """,
+                (connected_seller_id, connected_seller_id, account_id),
+            )
+            rows = cur.fetchall()
+
+    output = ["sku;vlr_min_classico;vlr_min_premium"]
+
+    for row in rows:
+        sku = row["sku"]
+        classico = format_decimal_br(row.get("min_receive_classico"))
+        premium = format_decimal_br(row.get("min_receive_premium"))
+        output.append(f"{sku};{classico};{premium}")
+
+    return "\n".join(output) + "\n"
 
 
 @app.get("/painel", response_class=HTMLResponse)
