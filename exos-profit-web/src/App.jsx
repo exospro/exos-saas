@@ -106,7 +106,7 @@ function App() {
       }
     } catch (err) {
       console.error(err);
-      window.location.href = `${import.meta.env.VITE_API_URL}/login`;
+      window.location.href = "/login";
     } finally {
       setLoading(false);
     }
@@ -338,9 +338,7 @@ function App() {
 
     try {
       setUploading(true);
-      setUploadMessage(`Arquivo enviado com sucesso. ${res.data.rows_saved} SKUs salvos.`);
-      setFile(null);
-      await loadMinReceiveInfo(selectedSeller.account_id);
+      setUploadMessage("");
 
       const formData = new FormData();
       formData.append("file", file);
@@ -357,6 +355,9 @@ function App() {
 
       setUploadMessage(`Arquivo enviado com sucesso. ${res.data.rows_saved} SKUs salvos.`);
       setFile(null);
+
+      await loadMinReceiveInfo(selectedSeller.account_id);
+      await loadSkuStats(selectedSeller.account_id, selectedSellerId);
     } catch (err) {
       console.error("UPLOAD ERROR:", err);
       console.error("UPLOAD RESPONSE:", err?.response?.data);
@@ -544,7 +545,7 @@ function App() {
 
               <div style={styles.uploadCompactRow}>
                 <a
-                  href={`${import.meta.env.VITE_API_URL}/template/sku-min-receber.csv?account_id=${selectedSeller?.account_id}&connected_seller_id=${selectedSellerId}`}
+                  href={`/template/sku-min-receber.csv?account_id=${selectedSeller?.account_id}&connected_seller_id=${selectedSellerId}`}
                   target="_blank"
                   style={styles.templateButtonSmall}
                 >
@@ -624,7 +625,7 @@ function App() {
                           <>
                             <a
                               style={styles.link}
-                              href={`${import.meta.env.VITE_API_URL}/download/csv?run_id=${job.run_id}`}
+                              href={`/download/csv?run_id=${job.run_id}&kind=summary`}
                               target="_blank"
                             >
                               Final
@@ -636,7 +637,7 @@ function App() {
 
                                 <a
                                   style={styles.linkSecondary}
-                                  href={`${import.meta.env.VITE_API_URL}/download/csv_detailed?run_id=${job.run_id}`}
+                                  href={`/download/csv?run_id=${job.run_id}&kind=detailed`}
                                   target="_blank"
                                 >
                                   Detalhado
