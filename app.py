@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, PlainTextResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import os
 import re
 import time
@@ -12,6 +13,8 @@ from pathlib import Path
 from urllib.parse import urlencode, quote
 import secrets
 from psycopg2.extras import Json, RealDictCursor, execute_values
+
+
 
 import requests
 
@@ -42,17 +45,24 @@ if os.environ.get("RENDER"):
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
-BASE_DIR = Path(__file__).resolve().parent
+WEB_DIST_DIR = BASE_DIR / "web_dist"
 CSV_DIR = BASE_DIR / "runtime_csv"
 LOG_DIR = BASE_DIR / "runtime_logs"
+
 CSV_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 ACTIVE_JOB_STATUSES = ("queued", "running")
-
 LIVE_SUBSCRIPTION_STATUSES = ("trialing", "active", "past_due", "paused")
 
 IS_PROD = bool(os.environ.get("RENDER"))
+
+if WEB_DIST_DIR.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(WEB_DIST_DIR / "assets")),
+        name="assets",
+    )
 
 try:
     import openpyxl
@@ -967,6 +977,15 @@ def render_login_page(error_message: str = "") -> str:
     </html>
     """
 
+
+@app.get("/favicon.svg")
+def favicon_svg():
+    return FileResponse(WEB_DIST_DIR / "favicon.svg")
+
+@app.get("/favicon.ico")
+def favicon_ico():
+    return FileResponse(WEB_DIST_DIR / "favicon.svg")
+
 @app.get("/api/me")
 def api_me(request: Request):
     user = require_user(request)
@@ -1075,7 +1094,7 @@ def login_page(error: str | None = None):
 @app.get("/auth/google/start")
 def auth_google_start(request: Request):
     state = secrets.token_urlsafe(24)
-    return_to = request.query_params.get("return_to", "/painel")
+    return_to = request.query_params.get("return_to", "/")
     params = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": GOOGLE_REDIRECT_URI,
@@ -1689,9 +1708,13 @@ def debug_cookies(request: Request):
     }
 
 @app.get("/")
-def root(request: Request):
-    user = get_session_user(request)
-    return RedirectResponse(url="/painel" if user else "/login")
+def serve_react_app():
+    index_file = WEB_DIST_DIR / "index.html"
+
+    if not index_file.exists():
+        return {"detail": "React build não encontrado."}
+
+    return FileResponse(index_file)
 
 
 @app.get("/template/sku-min-receber.csv")
@@ -1943,7 +1966,7 @@ def auth_google_callback(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     state_cookie = request.cookies.get("google_oauth_state")
-    return_to = request.cookies.get("post_login_redirect") or "/painel"
+    return_to = request.cookies.get("post_login_redirect") or "/"
 
     if not code or not state or not state_cookie or state != state_cookie:
         return RedirectResponse(url="/login?error=" + quote("Falha na autenticação com Google."))
@@ -2007,6 +2030,52 @@ def auth_google_callback(request: Request):
     response.delete_cookie("post_login_redirect")
 
     return response
+
+@app.get("/account/sku-stats")
+def account_sku_stats(
+    request: Request,
+    account_id: int,
+    connected_seller_id: int,
+):
+    user = require_user(request)
+    require_connected_seller_access(int(user["id"]), connected_seller_id)
+
+    with db_connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                WITH last_run AS (
+                    SELECT max(run_id) AS run_id
+                    FROM ml.inventory_snapshot_item
+                    WHERE connected_seller_id = %s
+                ),
+                inv AS (
+                    SELECT DISTINCT sku
+                    FROM ml.inventory_snapshot_item i
+                    JOIN last_run lr ON lr.run_id = i.run_id
+                    WHERE i.connected_seller_id = %s
+                    AND i.sku IS NOT NULL
+                    AND trim(i.sku) <> ''
+                )
+                SELECT
+                    count(*) AS count_total_skus,
+                    count(*) FILTER (
+                        WHERE COALESCE(m.min_receive_classico, 0) > 0
+                        OR COALESCE(m.min_receive_premium, 0) > 0
+                    ) AS count_with_min
+                FROM inv
+                LEFT JOIN app.account_sku_min_receive m
+                ON m.account_id = %s
+                AND m.sku = inv.sku
+                """,
+                (connected_seller_id, connected_seller_id, account_id),
+            )
+            row = cur.fetchone()
+
+    return {
+        "count_total_skus": int(row["count_total_skus"] or 0),
+        "count_with_min": int(row["count_with_min"] or 0),
+    }
 
 @app.get("/run/inventory")
 def run_inventory(request: Request, connected_seller_id: int = 1, limit: int = 0):
