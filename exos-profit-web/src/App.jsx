@@ -85,12 +85,6 @@ function App() {
   async function loadMe() {
     try {
       setError("");
-      const token = localStorage.getItem("token");
-
-      if (!token) {
-        window.location.href = `${import.meta.env.VITE_API_URL}/login`;
-        return;
-      }
 
       const res = await api.get("/api/me");
       setMe(res.data);
@@ -112,8 +106,6 @@ function App() {
       }
     } catch (err) {
       console.error(err);
-      localStorage.removeItem("token");
-      localStorage.removeItem("user");
       window.location.href = `${import.meta.env.VITE_API_URL}/login`;
     } finally {
       setLoading(false);
