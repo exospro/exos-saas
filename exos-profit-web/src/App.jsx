@@ -99,6 +99,11 @@ function App() {
             `/api/billing/summary?account_id=${firstSeller.account_id}`
           );
           setBilling(billingResp.data);
+          const planLimit = billingResp.data?.subscription?.mlb_limit;
+
+          if (planLimit) {
+            setLimit(planLimit);
+          }
 
           await loadMinReceiveInfo(firstSeller.account_id);
           await loadSkuStats(firstSeller.account_id, firstSeller.connected_seller_id);
