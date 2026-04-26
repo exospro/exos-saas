@@ -252,7 +252,7 @@ function App() {
     } finally {
       localStorage.removeItem("token");
       localStorage.removeItem("user");
-      window.location.href = `${import.meta.env.VITE_API_URL}/login`;
+      window.location.href = "/login";
     }
   }
 
@@ -383,7 +383,7 @@ function App() {
       <main style={styles.main}>
         <header style={styles.topbar}>
           <div>
-            <h1 style={styles.title}>Exos Tools</h1>
+            <h1 style={styles.title}>Exosss Tools</h1>
             <p style={styles.subtitle}>
               Automação de campanhas do Mercado Livre.
             </p>
