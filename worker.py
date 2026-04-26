@@ -78,6 +78,26 @@ def save_detailed_csv_to_job(run_id: str, csv_path: Path | None) -> bool:
         conn.commit()
     return True
 
+def normalize_cmd_paths(cmd: list[str], csv_file: str | None) -> list[str]:
+    if not csv_file:
+        return cmd
+
+    normalized = list(cmd)
+
+    out_path = CSV_DIR / csv_file
+    detailed_path = out_path.with_name(
+        f"{out_path.stem}_detalhado{out_path.suffix or '.csv'}"
+    )
+
+    for i, value in enumerate(normalized):
+        if value == "--out" and i + 1 < len(normalized):
+            normalized[i + 1] = str(out_path)
+
+        if value == "--out-detailed" and i + 1 < len(normalized):
+            normalized[i + 1] = str(detailed_path)
+
+    return normalized
+
 
 def purge_old_finished_jobs(connected_seller_id: int, keep_run_id: str, keep_last: int = 1) -> int:
     with db_connect() as conn:
@@ -315,12 +335,37 @@ def run_single_job(job: dict) -> None:
 
             update_job(run_id, step="optimizer", result_json=result_json)
             append_log(log_path, "[PIPELINE] Optimizer - Etapa 2/2 - Optimizer: iniciando")
-            result = run_command(payload["cmd"], log_path, "OPTIMIZER")
+            cmd = normalize_cmd_paths(payload["cmd"], csv_file)
+            result = run_command(cmd, log_path, "OPTIMIZER")            
             result_json["optimizer"] = result
             if result["returncode"] != 0:
                 raise RuntimeError("Optimizer falhou")
             finalize_and_cleanup(run_id, connected_seller_id, log_path, result_json=result_json, csv_file=csv_file)
 
+        elif job_type == "campaign_winner":
+            update_job(run_id, step="rebate")
+            rebate = run_command(payload["rebate_cmd"], log_path, "REBATE")
+            result_json["rebate"] = rebate
+
+            if rebate["returncode"] != 0:
+                raise RuntimeError("Rebate falhou. Optimizer não foi executado.")
+
+            update_job(run_id, step="optimizer")
+
+            optimizer_cmd = normalize_cmd_paths(payload["optimizer_cmd"], csv_file)
+            optimizer = run_command(optimizer_cmd, log_path, "OPTIMIZER")
+            result_json["optimizer"] = optimizer
+
+            if optimizer["returncode"] != 0:
+                raise RuntimeError("Optimizer falhou.")
+
+            finalize_and_cleanup(
+                run_id,
+                connected_seller_id,
+                log_path,
+                result_json=result_json,
+                csv_file=csv_file,
+            )
         elif job_type == "full":
             update_job(run_id, step="inventory", result_json=result_json)
             append_log(log_path, "[PIPELINE] Etapa 1/3 - Inventory: iniciando")
@@ -338,7 +383,8 @@ def run_single_job(job: dict) -> None:
 
             update_job(run_id, step="optimizer", result_json=result_json)
             append_log(log_path, "[PIPELINE] Etapa 3/3 - Optimizer: iniciando")
-            r3 = run_command(payload["optimizer_cmd"], log_path, "OPTIMIZER")
+            optimizer_cmd = normalize_cmd_paths(payload["optimizer_cmd"], csv_file)
+            r3 = run_command(optimizer_cmd, log_path, "OPTIMIZER")          
             result_json["optimizer"] = r3
             if r3["returncode"] != 0:
                 raise RuntimeError("Optimizer falhou")

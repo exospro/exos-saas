@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1426,6 +1427,9 @@ def format_row_for_csv(row: dict) -> dict:
 
 def write_audit_csv(path: str, rows: list[dict]):
     fieldnames = list(CSV_HEADERS.keys())
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)  # 👈 garante a pasta
+    print("DEBUG write_audit_csv usando arquivo atualizado:", path)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
         writer.writerow(CSV_HEADERS)
